@@ -88,16 +88,17 @@ cd checkpoints
 
 ```python
 # Config 클래스에서 설정 변경
+# 주의: 아래 값들은 예시이며, 실제 데이터에 맞게 조정해야 합니다.
 class Config:
-    ID = "202511201026498863"  # 시퀀스 ID
-    VIDEO_DIR = f"/workspace/sequences_sample/{ID}/image"
-    PCD_DIR = f"/workspace/sequences_sample/{ID}/pcd"
+    ID = "202511201026498863"  # 시퀀스 ID (사용자 데이터에 맞게 변경)
+    VIDEO_DIR = f"/workspace/sequences_sample/{ID}/image"  # 비디오 프레임 경로
+    PCD_DIR = f"/workspace/sequences_sample/{ID}/pcd"      # 포인트 클라우드 경로
     
-    # 프롬프트 포인트 설정 (첫 프레임에서 클릭한 좌표)
+    # 프롬프트 포인트 설정 (첫 프레임에서 클릭한 좌표 - 실제 이미지에 맞게 조정 필요)
     OBJ_1_POINTS = np.array([[1000, 450], [1000, 700], [1000, 575]], dtype=np.float32)
     OBJ_1_LABELS = np.array([1, 1, 0], dtype=np.int32)
     
-    # Depth threshold (미터)
+    # Depth threshold (미터 - 환경에 따라 조정)
     DEPTH_TH = 8.8
     MAX_DEPTH = 15.0
 ```
@@ -295,4 +296,4 @@ AVERAGE,245.8,248.9,120.1,118.0
 
 ---
 
-**Last Updated**: 2024-11-21
+**Last Updated**: 2025-01-21
