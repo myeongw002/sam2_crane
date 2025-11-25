@@ -469,7 +469,7 @@ def filter_points_by_mask(points_3d_cam, mask, K, D, W, H, depth_threshold=None,
     # 3. Depth threshold 체크 (옵션)
     if depth_threshold is not None:
         depth_min = depth_threshold - depth_range
-        depth_max = depth_threshold + depth_range
+        depth_max = depth_threshold + 0.25
         depth_valid = (points_3d_cam[:, 2] >= depth_min) & (points_3d_cam[:, 2] <= depth_max)
     else:
         depth_valid = np.ones(len(points_3d_cam), dtype=bool)
