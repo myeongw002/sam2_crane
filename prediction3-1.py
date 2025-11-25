@@ -68,7 +68,7 @@ predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=device
 # 4. 경로 및 파라미터 설정
 # ========================================
 class Config:
-    ID = "202511201026498863"
+    ID = "202511201026498853"
     BASE_DIR = f"/workspace/sequences_sample/{ID}"
     VIDEO_DIR = f"{BASE_DIR}/image"
     PCD_DIR = f"{BASE_DIR}/pcd"
@@ -99,6 +99,7 @@ class Config:
     SHOW_O3D = False
 
     ACWL_DZ = None  # Will be loaded from results
+    DEPTH_OFFSET = 0.3
     DEPTH_TH = None  # Will be calculated from ACWL_DZ
 
 os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
@@ -286,7 +287,7 @@ K_camera, D_dist, T_l2c = load_camera_params(Config.INTRINSIC_PATH, Config.EXTRI
 def show_mask(mask, ax, obj_id=None, random_color=False):
     """마스크 시각화"""
     if random_color:
-        color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
+        color = np.concatenate([np.random.random(3), np.array([0.3])], axis=0)
     else:
         cmap = plt.get_cmap("tab10")
         cmap_idx = 0 if obj_id is None else obj_id
@@ -371,6 +372,7 @@ model_points_2d = np.array([
     [MAGNET_WIDTH, 0.0]     # Point 3: TR
 ], dtype=np.float32)
 
+
 model_points_3d_top = np.hstack([model_points_2d, np.zeros((4, 1))])
 
 def affine_matrix(param):
@@ -433,80 +435,119 @@ def order_points_for_model(pts):
     return rect
 
 
+def mask_from_minrect(point_mask, min_points=20):
+    """
+    point_mask: bool(H, W), sparse 형태
+    → cv2.minAreaRect()로 외곽 Rotated Rectangle 생성 후 내부 fill
+    """
+    H, W = point_mask.shape
+    ys, xs = np.where(point_mask)
 
-def filter_points_by_mask(points_3d_cam, mask, K, D, W, H, depth_threshold=None, depth_range=0.1, update_mask=False):
+    # 포인트가 너무 적으면 신뢰 불가
+    if len(xs) < min_points:
+        return point_mask   # 그대로 반환
+
+    pts = np.stack([xs, ys], axis=1).astype(np.float32)
+
+    # 1) minAreaRect
+    rect = cv2.minAreaRect(pts)   # (center(x,y), (w,h), angle)
+    box  = cv2.boxPoints(rect).astype(int)  # 4 x 2
+
+    # 2) box를 이용해 채운 mask 생성
+    filled = np.zeros((H, W), dtype=np.uint8)
+    cv2.fillPoly(filled, [box], 255)
+
+    return (filled > 0), box
+
+
+
+def filter_points_by_mask(points_3d_cam, mask, K, D, W, H,
+                          depth_threshold=None, depth_range=0.1,
+                          update_mask=False):
     """
     3D 포인트(Camera Frame) 중 2D 마스크 내부에 위치한 포인트만 필터링
-    
+
     Args:
         points_3d_cam: 3D 포인트 (N, 3)
         mask: 2D 마스크 (H, W)
         K, D: 카메라 파라미터
         W, H: 이미지 크기
-        depth_threshold: Z값 임계값. 이 값보다 큰 점들은 필터링됨
-        update_mask: True이면 threshold 초과 포인트의 마스크 픽셀을 False로 업데이트
-    
+        depth_threshold: 중심 Z값 (m). 이 값 ± depth_range 범위만 통과
+        depth_range: 허용 깊이 반경 (m)
+        update_mask: True면 '통과한 포인트들'만으로 새 마스크를 생성
+
     Returns:
         filtered_points: 필터링된 3D 포인트
-        updated_mask: update_mask=True일 때 업데이트된 마스크, 아니면 None
+        updated_mask: update_mask=True일 때 새로 만든 마스크, 아니면 None
     """
     if len(points_3d_cam) == 0 or mask is None:
-        return (np.array([]), mask.copy() if update_mask else None) if update_mask else np.array([])
+        if update_mask:
+            return np.array([]), np.zeros_like(mask, dtype=bool)
+        else:
+            return np.array([])
 
-    # 1. 3D -> 2D 투영 (왜곡 보정 포함)
-    # rvec, tvec는 0 (이미 Camera Frame이므로)
-    img_pts, _ = cv2.projectPoints(points_3d_cam, np.zeros(3), np.zeros(3), K, D)
-    img_pts = img_pts.squeeze() # (N, 2)
+    # 1. 3D -> 2D 투영
+    img_pts, _ = cv2.projectPoints(
+        points_3d_cam,
+        np.zeros(3), np.zeros(3),
+        K, D
+    )
+    img_pts = img_pts.squeeze()   # (N, 2)
 
-    # 2. 이미지 범위 체크
     u = img_pts[:, 0]
     v = img_pts[:, 1]
-    
-    # 좌표가 이미지 범위 안인지 확인
+
+    # 2. 이미지 범위 체크
     valid_uv = (u >= 0) & (u < W) & (v >= 0) & (v < H)
-    
-    # 3. Depth threshold 체크 (옵션)
+
+    # 3. 깊이 범위 체크
     if depth_threshold is not None:
         depth_min = depth_threshold - depth_range
-        depth_max = depth_threshold + 0.1
+        depth_max = depth_threshold + depth_range
         depth_valid = (points_3d_cam[:, 2] >= depth_min) & (points_3d_cam[:, 2] <= depth_max)
     else:
         depth_valid = np.ones(len(points_3d_cam), dtype=bool)
-    
-    # 4. 마스크 확인
-    # valid_uv와 depth_valid가 True인 인덱스에 대해서만 마스크 값 조회 (정수 변환)
+
+    # 4. 마스크 안쪽 여부
     combined_valid = valid_uv & depth_valid
     u_valid = u[combined_valid].astype(int)
     v_valid = v[combined_valid].astype(int)
-    
-    # 마스크가 1(True)인 픽셀인지 확인
+
     in_mask = mask[v_valid, u_valid]
-    
-    # combined_valid 통과한 애들 중에서도 in_mask인 애들의 원래 인덱스 찾기
-    # 1) combined_valid 인덱스 추출
+
+    # combined_valid 인덱스 중 실제로 mask=True 인 것만 최종 통과
     indices_in_bounds = np.where(combined_valid)[0]
-    # 2) 그 중에서 mask 통과한 인덱스
     final_indices = indices_in_bounds[in_mask]
-    
-    # 5. 마스크 업데이트 (옵션)
-    updated_mask = None
+
+    filtered_points = points_3d_cam[final_indices]
+
+    # 5. update_mask=True: "통과한 포인트들"로 새 마스크 생성
     if update_mask:
-        updated_mask = mask.copy()
-        # Depth threshold 초과 포인트들의 마스크 픽셀을 False로 설정
-        if depth_threshold is not None:
-            invalid_depth_indices = np.where(valid_uv & ~depth_valid)[0]
-            u_invalid = u[invalid_depth_indices].astype(int)
-            v_invalid = v[invalid_depth_indices].astype(int)
-            # 범위 체크 후 마스크 업데이트
-            valid_coords = (u_invalid >= 0) & (u_invalid < W) & (v_invalid >= 0) & (v_invalid < H)
-            u_invalid = u_invalid[valid_coords]
-            v_invalid = v_invalid[valid_coords]
-            updated_mask[v_invalid, u_invalid] = False
-    
-    if update_mask:
-        return points_3d_cam[final_indices], updated_mask
+        updated_mask_sparse = np.zeros_like(mask, dtype=bool)
+
+        if len(final_indices) > 0:
+            u_final = u[final_indices].astype(int)
+            v_final = v[final_indices].astype(int)
+            valid = (
+                (u_final >= 0) & (u_final < W) &
+                (v_final >= 0) & (v_final < H)
+            )
+            u_final = u_final[valid]
+            v_final = v_final[valid]
+            updated_mask_sparse[v_final, u_final] = True
+
+        # === 핵심 변경점: minAreaRect 방식 적용 ===
+        updated_mask_solid, minrect_pts = mask_from_minrect(
+            updated_mask_sparse,
+            min_points=30    # 필요시 조정
+        )
+
+        print(f"[INFO] mask rebuilt via minAreaRect. area={updated_mask_solid.sum()} pixels")
+
+        return filtered_points, updated_mask_solid
     else:
-        return points_3d_cam[final_indices]
+        print(f"mask not updated")
+        return filtered_points
 
 
 
@@ -869,7 +910,6 @@ def calculate_length_measurements(magnet_pose, slab_corners_3d):
     # 위쪽 측정점 (P1): X=0.45, Y = 0.7 (700mm)
     # 아래쪽 측정점 (P2): X=0.45, Y = 2.25 - 0.7 (1.55m)
     # 측정 방향 (Normal): X축 양의 방향 (1, 0, 0) -> 그림상 오른쪽 화살표
-    
     local_p1 = np.array([MAGNET_WIDTH, 0.7, 0.0])
     local_p2 = np.array([MAGNET_WIDTH, MAGNET_LENGTH - 0.7, 0.0])
     
@@ -1133,7 +1173,8 @@ def initialize_sam2_and_prompts():
 
     # Config 업데이트
     Config.ACWL_DZ = acwl_dz
-    Config.DEPTH_TH = 10 - (acwl_dz * 0.001) + 0.3
+
+    Config.DEPTH_TH = 10 - (acwl_dz * 0.001) + Config.DEPTH_OFFSET
 
     # Obj1 자동 프롬프트
     Config.OBJ_1_POINTS = get_prompt_points_from_dz(acwl_dz)
@@ -1210,6 +1251,111 @@ def build_video_segments(inference_state):
     return video_segments
 
 
+def project_point_to_plane(P, n, p0):
+    """3D 점 P를 (n, p0)로 정의된 평면에 직교 사영."""
+    v = P - p0
+    dist = np.dot(v, n)
+    return P - dist * n
+
+def project_dir_to_plane(d, n):
+    """방향벡터 d를 평면에 평행한 성분만 남기도록 투영."""
+    d_proj = d - np.dot(d, n) * n
+    norm = np.linalg.norm(d_proj)
+    if norm < 1e-12:
+        return None
+    return d_proj / norm
+
+def intersect_line_with_segment_on_plane(P0, d, A, B, n):
+    """
+    평면 위에 있는 직선 L(s) = P0 + s*d 와
+    평면 위 선분 S(u) = A + u*(B-A), u∈[0,1] 의 교점 계산.
+
+    모든 점은 같은 평면 위에 있다고 가정하고,
+    법선 n의 절댓값이 가장 큰 축을 버린 후,
+    나머지 2축에서 2×2 연립방정식을 풀어 (s, u)를 구한다.
+    """
+    d = d.astype(float)
+    A = A.astype(float)
+    B = B.astype(float)
+    P0 = P0.astype(float)
+
+    # 버릴 축 선택
+    k = np.argmax(np.abs(n))
+    idx = [0, 1, 2]
+    idx.remove(k)
+    i, j = idx[0], idx[1]
+
+    e = B - A
+
+    M = np.array([
+        [d[i], -e[i]],
+        [d[j], -e[j]]
+    ], dtype=float)
+
+    rhs = np.array([
+        A[i] - P0[i],
+        A[j] - P0[j]
+    ], dtype=float)
+
+    det = np.linalg.det(M)
+    if abs(det) < 1e-12:
+        # 직선과 선분이 평행하거나 거의 평행
+        return None, None, None
+
+    s, u = np.linalg.solve(M, rhs)
+
+    # 선분 내부에 있는지 체크
+    if u < 0.0 or u > 1.0:
+        return None, None, None
+
+    P_int = P0 + s * d
+    return P_int, s, u
+
+def compute_closest_intersection_on_slab(P0, d, slab_corners_3d, n, p0):
+    """
+    시작점 P0에서 방향 d로 정의된 직선을 평면에 사영한 뒤,
+    그 사영 직선과 slab 4개 엣지의 교점 중
+    |s|가 최소인(가장 가까운) 교점을 반환.
+
+    Returns:
+        P_int (3,), s (float) or (None, None) if no intersection.
+    """
+    # 1) 직선 방향, 시작점 평면에 사영
+    d_plane = project_dir_to_plane(d, n)
+    if d_plane is None:
+        return None, None
+
+    P0_plane = project_point_to_plane(P0, n, p0)
+
+    # 2) slab 엣지들 정의
+    C0, C1, C2, C3 = slab_corners_3d
+    edges = [(C0, C1), (C1, C2), (C2, C3), (C3, C0)]
+    
+    print(f"Edge length checks:")
+    for A, B in edges:
+        print(f"  Edge {A} to {B}: length = {np.linalg.norm(B - A):.4f} m")
+
+    best_P = None
+    best_s = None
+    best_abs_s = np.inf
+
+    for A, B in edges:
+        P_int, s, u = intersect_line_with_segment_on_plane(P0_plane, d_plane, A, B, n)
+        if P_int is None:
+            continue
+        if abs(s) < best_abs_s:
+            best_abs_s = abs(s)
+            best_s = s
+            best_P = P_int
+
+    return best_P, best_s
+
+def project_point_to_plane(P, n, p0):
+    # n: unit normal
+    # p0: point on plane
+    d = np.dot(n, (P - p0))
+    return P - d * n
+
 def compute_and_draw_measurements(
     ax,
     f_idx,
@@ -1224,106 +1370,124 @@ def compute_and_draw_measurements(
     - 마그넷 박스(final_vertices)와 철판 코너(slab_corners_3d)를 이용해
       P1-P2, P3-P4, P5-P6, P7-P8 거리를 계산하고
       이미지를 기준으로 화살표 및 텍스트를 그린다.
-    - 측정 결과 dict를 반환한다.
+    - 길이·너비 모두 3D 직선 → 평면 사영 → 엣지 교점 → 3D 거리 방식으로 계산.
     """
-    # ========== 준비 ==========
-    # 슬래브 중심
-    slab_center = np.mean(slab_corners_3d[:, :2], axis=0)
+    print(f"\n========== compute_and_draw_measurements (frame {f_idx:03d}) ==========")
 
-    # 최종 박스 꼭짓점 (이름만 정리)
-    top_left_corner    = final_vertices[0]  # TL
-    bottom_left_corner = final_vertices[1]  # BL
+    # ---------------------------
+    # 기본 준비
+    # ---------------------------
+    n = normal_obj2.astype(float)
+    n = n / (np.linalg.norm(n) + 1e-12)
+    p0 = centroid_obj2.astype(float)
+
+    # final_vertices: ICP까지 적용된 마그넷 8개 꼭짓점 (카메라 좌표계)
+    # 인덱스: 0=TL, 1=BL, 2=BR, 3=TR, 4~7는 아래쪽
+    top_left_corner    = final_vertices[0]
+    bottom_left_corner = final_vertices[1]
+    bottom_right_corner= final_vertices[2]
+    top_right_corner   = final_vertices[3]
+
 
     # 마그넷 길이 방향 param (0~MAGNET_LENGTH)
     t1 = 0.7 / MAGNET_LENGTH
     t2 = (MAGNET_LENGTH - 0.7) / MAGNET_LENGTH
 
-    # 길이 측정 시작점 (3D)
-    measure_pt_top = top_left_corner + t1 * (bottom_left_corner - top_left_corner)
-    measure_pt_bot = top_left_corner + t2 * (bottom_left_corner - top_left_corner)
+    # 길이 측정 시작점 (3D, 좌측 에지 기준)
+    measure_pt_top1 = top_left_corner + t1 * (bottom_left_corner - top_left_corner)
+    measure_pt_bot1 = top_left_corner + t2 * (bottom_left_corner - top_left_corner)
 
-    # 회전 행렬 (Yaw + ICP)
-    yaw = estimated_param[2]
-    R_theta = np.array([
-        [np.cos(yaw), -np.sin(yaw), 0],
-        [np.sin(yaw),  np.cos(yaw), 0],
-        [0, 0, 1]
-    ])
-    R_icp = T_icp_final[:3, :3]
-    R_total = R_icp @ R_theta
+    # 우측 에지(참고용, 지금은 사용 안 함)
+    measure_pt_top2 = top_right_corner + t1 * (bottom_right_corner - top_right_corner)
+    measure_pt_bot2 = top_right_corner + t2 * (bottom_right_corner - top_right_corner)
 
-    # 길이 방향: 로컬 x축 → 월드
-    dir_world = R_total @ np.array([1.0, 0.0, 0.0])
-    measure_dir_2d = dir_world[:2]
-    measure_dir_2d /= (np.linalg.norm(measure_dir_2d) + 1e-12)
+    print(f"[DEBUG] measure_pt_top1 = {measure_pt_top1}")
+    print(f"[DEBUG] measure_pt_bot1 = {measure_pt_bot1}")
 
-    # 보조 함수: ray-line 거리
-    def ray_line_dist(start_pt, direction, p1, p2):
-        x1, y1 = start_pt
-        dx, dy = direction
-        x3, y3 = p1
-        x4, y4 = p2
-        denom = dx * (y3 - y4) - dy * (x3 - x4)
-        if abs(denom) < 1e-6:
-            return 0.0
-        t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
-        return abs(t)
+    # ---------------------------
+    # 1) 길이 측정 (Top / Bottom)
+    #    - 각 측정점에서 길이 방향 직선을 잡고
+    #    - 직선을 평면에 사영 후, slab 엣지와 교점
+    #    - 원래 측정점 ↔ 교점 3D 거리
+    # ---------------------------
+    end_pt_top_3d = measure_pt_top1
+    end_pt_bot_3d = measure_pt_bot1
+    len_top_mm = 0.0
+    len_bot_mm = 0.0
 
-    # ========== 길이 측정 엣지 선택 ==========
-    dots = np.dot(slab_corners_3d[:, :2] - slab_center, measure_dir_2d)
-    target_idx = np.argsort(dots)[-2:]
-    edge_p1 = slab_corners_3d[target_idx[0], :2]
-    edge_p2 = slab_corners_3d[target_idx[1], :2]
+    # 마그넷 축 방향 벡터 (순수 3D)
+    len_top_vec   = measure_pt_top1 - measure_pt_top2       # 길이 방향
+    width_top_vec = top_left_corner   - bottom_left_corner       # 너비 방향
+    len_bot_vec   = measure_pt_bot1 - measure_pt_bot2       # 길이 방향
+    width_bot_vec = top_right_corner   - bottom_right_corner       # 너비 방향
 
-    # 길이(위/아래) 계산
-    len_top_mm = ray_line_dist(measure_pt_top[:2], measure_dir_2d, edge_p1, edge_p2) * 1000.0
-    len_bot_mm = ray_line_dist(measure_pt_bot[:2], measure_dir_2d, edge_p1, edge_p2) * 1000.0
+    len_top_dir = len_top_vec / (np.linalg.norm(len_top_vec) + 1e-12)
+    width_top_dir = width_top_vec / (np.linalg.norm(width_top_vec) + 1e-12)
+    len_bot_dir = len_bot_vec / (np.linalg.norm(len_bot_vec) + 1e-12)
+    width_bot_dir = width_bot_vec / (np.linalg.norm(width_bot_vec) + 1e-12)
 
-    # ========== 너비 측정 (윗변) ==========
-    width_dir_world = R_total @ np.array([0.0, -1.0, 0.0])  # 로컬 -y
-    width_dir_2d = width_dir_world[:2]
-    width_dir_2d /= (np.linalg.norm(width_dir_2d) + 1e-12)
+    # Top 길이
+    P_int_top, s_top = compute_closest_intersection_on_slab(
+        measure_pt_top1, len_top_dir, slab_corners_3d, n, p0
+    )
+    if P_int_top is not None:
+        proj_top1 = project_point_to_plane(measure_pt_top1, n, p0)
+        len_top_mm = np.linalg.norm(P_int_top - proj_top1) * 1000.0
+        end_pt_top_3d = P_int_top
+    print(f"[DEBUG] Length Top (mm) = {len_top_mm:.3f}")
 
-    dots_width = np.dot(slab_corners_3d[:, :2] - slab_center, width_dir_2d)
-    target_idx_width = np.argsort(dots_width)[-2:]
-    edge_w1 = slab_corners_3d[target_idx_width[0], :2]
-    edge_w2 = slab_corners_3d[target_idx_width[1], :2]
+    # Bottom 길이
+    P_int_bot, s_bot = compute_closest_intersection_on_slab(
+        measure_pt_bot1, len_bot_dir, slab_corners_3d, n, p0
+    )
+    if P_int_bot is not None:
+        proj_bot1 = project_point_to_plane(measure_pt_bot1, n, p0)
+        len_bot_mm = np.linalg.norm(P_int_bot - proj_bot1) * 1000.0
+        end_pt_bot_3d = P_int_bot
+    print(f"[DEBUG] Length Bottom (mm) = {len_bot_mm:.3f}")
 
-    width_dist = ray_line_dist(top_left_corner[:2], width_dir_2d, edge_w1, edge_w2)
-    width_mm = width_dist * 1000.0
+    # ---------------------------
+    # 2) 너비 측정 (Top / Bottom)
+    #    - Top: top_left에서 width_dir 방향
+    #    - Bottom: bottom_left에서 width_dir 방향
+    # ---------------------------
+    end_pt_width_top_3d = top_left_corner
+    end_pt_width_bottom_3d = bottom_left_corner
+    width_top_mm = 0.0
+    width_bottom_mm = 0.0
 
-    # ========== 너비 측정 (아랫변) ==========
-    width_bottom_dir_world = R_total @ np.array([0.0, 1.0, 0.0])  # 로컬 +y
-    width_bottom_dir_2d = width_bottom_dir_world[:2]
-    width_bottom_dir_2d /= (np.linalg.norm(width_bottom_dir_2d) + 1e-12)
+    # Width Top
+    P_int_wtop, s_wtop = compute_closest_intersection_on_slab(
+        top_left_corner, width_top_dir, slab_corners_3d, n, p0
+    )
+    if P_int_wtop is not None:
+        proj_wtop = project_point_to_plane(top_left_corner, n, p0)
+        width_top_mm = np.linalg.norm(P_int_wtop - proj_wtop) * 1000.0
+        end_pt_width_top_3d = P_int_wtop
+    print(f"[DEBUG] Width Top (mm) = {width_top_mm:.3f}")
 
-    dots_width_bottom = np.dot(slab_corners_3d[:, :2] - slab_center, width_bottom_dir_2d)
-    target_idx_width_bottom = np.argsort(dots_width_bottom)[-2:]
-    edge_wb1 = slab_corners_3d[target_idx_width_bottom[0], :2]
-    edge_wb2 = slab_corners_3d[target_idx_width_bottom[1], :2]
+    # Width Bottom
+    P_int_wbot, s_wbot = compute_closest_intersection_on_slab(
+        bottom_left_corner, width_bot_dir, slab_corners_3d, n, p0
+    )
+    if P_int_wbot is not None:
+        proj_wbot = project_point_to_plane(bottom_left_corner, n, p0)
+        width_bottom_mm = np.linalg.norm(P_int_wbot - proj_wbot) * 1000.0
+        end_pt_width_bottom_3d = P_int_wbot
+    print(f"[DEBUG] Width Bottom (mm) = {width_bottom_mm:.3f}")
 
-    width_bottom_dist = ray_line_dist(bottom_left_corner[:2], width_bottom_dir_2d, edge_wb1, edge_wb2)
-    width_bottom_mm = width_bottom_dist * 1000.0
-
-    print(f"   📏 Length Top: {len_top_mm:.1f}mm, Bottom: {len_bot_mm:.1f}mm")
-    print(f"   📐 Width Top: {width_mm:.1f}mm, Bottom: {width_bottom_mm:.1f}mm")
-
-    # ========== 3D → 2D 투영 후 화살표/텍스트 그리기 ==========
-    # 끝점 3D 계산
-    end_pt_top_3d  = measure_pt_top  + dir_world * (len_top_mm / 1000.0)
-    end_pt_bot_3d  = measure_pt_bot  + dir_world * (len_bot_mm / 1000.0)
-    end_pt_width_3d        = top_left_corner    + width_dir_world        * (width_mm / 1000.0)
-    end_pt_width_bottom_3d = bottom_left_corner + width_bottom_dir_world * (width_bottom_mm / 1000.0)
-
+    # ---------------------------
+    # 3) 3D → 2D 투영 (시각화용)
+    # ---------------------------
     pts_to_project = np.array([
-        measure_pt_top,          # 0
-        measure_pt_bot,          # 1
-        top_left_corner,         # 2
-        bottom_left_corner,      # 3
-        end_pt_top_3d,           # 4
-        end_pt_bot_3d,           # 5
-        end_pt_width_3d,         # 6
-        end_pt_width_bottom_3d   # 7
+        measure_pt_top1,          # 0
+        measure_pt_bot1,          # 1
+        top_left_corner,          # 2
+        bottom_left_corner,       # 3
+        end_pt_top_3d,            # 4
+        end_pt_bot_3d,            # 5
+        end_pt_width_top_3d,      # 6
+        end_pt_width_bottom_3d    # 7
     ])
 
     img_measure_pts, _ = cv2.projectPoints(
@@ -1340,6 +1504,10 @@ def compute_and_draw_measurements(
     p_end_bot          = img_measure_pts[5]
     p_end_width        = img_measure_pts[6]
     p_end_width_bottom = img_measure_pts[7]
+
+    # ---------------------------
+    # 4) 2D 화살표 및 텍스트 그리기
+    # ---------------------------
 
     # 길이 위쪽 (노란색)
     ax.plot(p_start_top[0], p_start_top[1], 'o', color='yellow', markersize=6, markeredgecolor='black')
@@ -1372,7 +1540,7 @@ def compute_and_draw_measurements(
                 arrowprops=dict(arrowstyle='->', color='magenta', lw=2, shrinkA=0, shrinkB=0))
     mid_width = (p_start_width + p_end_width) / 2
     ax.text(
-        mid_width[0] - 40, mid_width[1], f'{width_mm:.0f}mm',
+        mid_width[0] - 40, mid_width[1], f'{width_top_mm:.0f}mm',
         color='magenta', fontsize=9, weight='bold', ha='right',
         bbox=dict(boxstyle='round,pad=0.2', facecolor='black', alpha=0.6)
     )
@@ -1389,29 +1557,23 @@ def compute_and_draw_measurements(
         bbox=dict(boxstyle='round,pad=0.2', facecolor='black', alpha=0.6)
     )
 
-    # CSV용 레코드 반환
+    # ---------------------------
+    # 5) CSV용 레코드 반환
+    # ---------------------------
     measurement_record = {
         'frame': f_idx,
         'P1-P2': len_top_mm,
         'P3-P4': len_bot_mm,
-        'P5-P6': width_mm,
+        'P5-P6': width_top_mm,
         'P7-P8': width_bottom_mm
     }
+    print(f"[DEBUG] measurement_record = {measurement_record}")
     return measurement_record
 
 
-def process_single_frame(
-    f_idx,
-    fname,
-    pcd_files,
-    video_segments,
-    obj_id_1,
-    obj_id_2,
-    last_successful_pose
-):
-    img_path = os.path.join(Config.VIDEO_DIR, fname)
-    pcd_path = os.path.join(Config.PCD_DIR, pcd_files[f_idx]) if f_idx < len(pcd_files) else None
 
+def load_and_prepare_frame(f_idx, fname):
+    img_path = os.path.join(Config.VIDEO_DIR, fname)
     img = Image.open(img_path).convert("RGB")
     W, H = img.size
 
@@ -1425,210 +1587,381 @@ def process_single_frame(
     ax.set_ylim([H, 0])
     ax.set_axis_off()
 
-    masks = video_segments.get(f_idx, {})
+    return img, fig, ax, W, H, img_path
+
+# ------------------------------------------------------------
+# 2. 마스크/Rotated Box 추출
+# ------------------------------------------------------------
+def extract_masks_and_rboxes(ax, masks, obj_id_1, obj_id_2, H, W):
     mask_obj1 = masks.get(obj_id_1, None)
     mask_obj2 = masks.get(obj_id_2, None)
 
-    estimated_param = None
     obj1_corners = None
     obj2_rbox_corners = None
 
-    # 1. 마스크 및 RBox 추출
     for oid in [obj_id_1, obj_id_2]:
         mask = masks.get(oid)
-        if mask is not None:
-            edge = "orange" if oid == obj_id_1 else "deepskyblue"
-            draw_mask_and_rbox(
-                ax, mask, oid, edge, H, W,
-                Config.APPLY_EROSION, Config.EROSION_KERNEL_SIZE, Config.EROSION_ITERATIONS
-            )
-            mask_eroded = apply_erosion(mask, Config.EROSION_KERNEL_SIZE, Config.EROSION_ITERATIONS) if Config.APPLY_EROSION else mask
-            corners, *_ = mask_to_rotated_box(mask_eroded)
+        if mask is None:
+            continue
 
-            if corners is not None:
-                if oid == obj_id_1:
-                    obj1_corners = corners
-                elif oid == obj_id_2:
-                    obj2_rbox_corners = corners
+        edge_color = "orange" if oid == obj_id_1 else "deepskyblue"
 
+        # 원래 마스크 그리기
+        draw_mask_and_rbox(
+            ax, mask, oid, edge_color, H, W,
+            Config.APPLY_EROSION, Config.EROSION_KERNEL_SIZE, Config.EROSION_ITERATIONS
+        )
+
+        # erosion 적용 여부
+        mask_eroded = apply_erosion(mask, Config.EROSION_KERNEL_SIZE, Config.EROSION_ITERATIONS) \
+            if Config.APPLY_EROSION else mask
+
+        corners, *_ = mask_to_rotated_box(mask_eroded)
+        if corners is None:
+            continue
+
+        if oid == obj_id_1:
+            obj1_corners = corners
+        else:
+            obj2_rbox_corners = corners
+
+    return mask_obj1, mask_obj2, obj1_corners, obj2_rbox_corners
+
+# ------------------------------------------------------------
+# 3. Obj1 Pose 추정 (LS)
+# ------------------------------------------------------------
+def estimate_pose_obj1(obj1_corners, last_successful_pose):
+    ordered_corners = order_points_for_model(obj1_corners)
+    initial_param = last_successful_pose.copy()
+
+    res = least_squares(
+        cost_function, initial_param,
+        args=(model_points_3d_top, ordered_corners, K_camera, D_dist),
+        loss='soft_l1'
+    )
+    estimated_param = res.x
+    last_successful_pose = estimated_param.copy()
+    return estimated_param, last_successful_pose
+
+# ------------------------------------------------------------
+# 4. Obj2 포인트 필터링 + rbox 갱신
+# ------------------------------------------------------------
+def prepare_obj2_points_and_rbox(
+    pcd_path,
+    mask_obj2,
+    obj_id_2,
+    ax,
+    H,
+    W
+):
+    obj2_pts_cam = None
+    obj2_rbox_corners = None
+
+    if not (pcd_path and os.path.exists(pcd_path) and mask_obj2 is not None):
+        return obj2_pts_cam, mask_obj2, obj2_rbox_corners
+
+    # LiDAR PCD → Camera
+    pcd = o3d.io.read_point_cloud(pcd_path)
+    pts_l = np.asarray(pcd.points, dtype=np.float32)
+    pts_h = np.hstack([pts_l, np.ones((len(pts_l), 1), dtype=np.float32)])
+
+    P_full_cam = (T_l2c @ pts_h.T).T[:, :3]
+
+    # 마스크 + 깊이 필터링
+    obj2_pts_cam, mask_obj2_updated = filter_points_by_mask(
+        P_full_cam, mask_obj2, K_camera, D_dist, W, H,
+        depth_threshold=Config.DEPTH_TH, update_mask=True
+    )
+    print(f"   🔍 Obj2 filtered: {len(obj2_pts_cam)}/{len(P_full_cam)} points (depth < {Config.DEPTH_TH}m)")
+
+    # mask 업데이트 시 다시 RBox
+    if mask_obj2_updated is not None:
+        mask_obj2 = mask_obj2_updated
+        draw_mask_and_rbox(
+            ax, mask_obj2, obj_id_2, "deepskyblue", H, W,
+            Config.APPLY_EROSION, Config.EROSION_KERNEL_SIZE, Config.EROSION_ITERATIONS
+        )
+        mask_eroded_obj2 = apply_erosion(mask_obj2, Config.EROSION_KERNEL_SIZE, Config.EROSION_ITERATIONS) \
+            if Config.APPLY_EROSION else mask_obj2
+        corners_updated, *_ = mask_to_rotated_box(mask_eroded_obj2)
+        if corners_updated is not None:
+            obj2_rbox_corners = corners_updated
+            print(f"   🔄 Obj2 rbox updated with filtered mask")
+
+    return obj2_pts_cam, mask_obj2, obj2_rbox_corners
+
+# ------------------------------------------------------------
+# 5. Obj2 평면 적합 + ICP 정렬
+# ------------------------------------------------------------
+def fit_plane_and_icp_for_obj2(
+    obj2_pts_cam,
+    obj2_rbox_corners,
+    estimated_param
+):
+    normal_obj2 = None
+    centroid_obj2 = None
+    synthetic_plane_cloud = None
+    T_icp_final = np.identity(4)
+    final_box_mesh = None
+    final_wireframe = None
+
+    if obj2_rbox_corners is None or obj2_pts_cam is None or len(obj2_pts_cam) <= 10:
+        return normal_obj2, centroid_obj2, synthetic_plane_cloud, T_icp_final, final_box_mesh, final_wireframe
+
+    # 평면 피팅
+    normal_obj2, _, centroid_obj2, inlier_mask_obj2 = two_stage_plane_fit(obj2_pts_cam)
+    if normal_obj2 is None:
+        return normal_obj2, centroid_obj2, synthetic_plane_cloud, T_icp_final, final_box_mesh, final_wireframe
+
+    inlier_pts_obj2 = obj2_pts_cam[inlier_mask_obj2]
+    if len(inlier_pts_obj2) > 3:
+        centroid_obj2 = inlier_pts_obj2.mean(axis=0)
+
+    # 합성 평면 포인트 생성
+    synthetic_plane_cloud = generate_synthetic_plane_cloud(
+        obj2_rbox_corners, normal_obj2, centroid_obj2, K_camera, D_dist
+    )
+
+    # Obj1 bottom cloud
+    obj1_bottom_cloud = get_obj1_bottom_cloud(estimated_param)
+
+    # ICP 정렬
+    if synthetic_plane_cloud is not None and len(synthetic_plane_cloud) > 10:
+        print(f"   🔌 Aligning Obj1 Bottom to Obj2 Plane (Target Pts: {len(synthetic_plane_cloud)})")
+        T_icp_final = refine_pose_icp_constrained(
+            obj1_bottom_cloud, synthetic_plane_cloud, max_iteration=30
+        )
+        print(f"   ✅ ICP Constrained Result:\n{T_icp_final}")
+        delta_t = np.linalg.norm(T_icp_final[:3, 3])
+        if delta_t > 1.0:
+            print(f"   ⚠️ ICP Delta too large ({delta_t:.2f}m). Ignored.")
+            T_icp_final = np.identity(4)
+
+    # 박스 메쉬 생성/변환
+    base_mesh, base_wire = get_3d_box_mesh(estimated_param, color=[1, 0, 0])
+    base_mesh.transform(T_icp_final)
+    base_wire.transform(T_icp_final)
+    final_box_mesh = base_mesh
+    final_wireframe = base_wire
+
+    return normal_obj2, centroid_obj2, synthetic_plane_cloud, T_icp_final, final_box_mesh, final_wireframe
+
+# ------------------------------------------------------------
+# 6. 슬래브 RBox → 3D 코너 복원
+# ------------------------------------------------------------
+def reconstruct_slab_corners_3d(obj2_rbox_corners, normal_obj2, centroid_obj2):
+    if obj2_rbox_corners is None or normal_obj2 is None or centroid_obj2 is None:
+        return None
+
+    uv_pts = np.asarray(obj2_rbox_corners, dtype=np.float32).reshape(-1, 1, 2)
+    xy_undist = cv2.undistortPoints(uv_pts, K_camera, D_dist).squeeze()
+
+    slab_corners_3d = []
+    n = np.asarray(normal_obj2, dtype=np.float32)
+    n = n / (np.linalg.norm(n) + 1e-12)
+    p0 = np.asarray(centroid_obj2, dtype=np.float32)
+
+    for x_n, y_n in xy_undist:
+        d_ray = np.array([x_n, y_n, 1.0], dtype=np.float32)
+        d_ray = d_ray / np.linalg.norm(d_ray)
+        denom = float(np.dot(n, d_ray))
+        if abs(denom) < 1e-6:
+            continue
+        t = float(np.dot(n, p0) / denom)
+        if t <= 0:
+            continue
+        P = d_ray * t
+        slab_corners_3d.append(P)
+
+    if len(slab_corners_3d) != 4:
+        return None
+    return np.array(slab_corners_3d)
+
+# ------------------------------------------------------------
+# 7. 3D 박스 → 2D 와이어프레임 그리기
+# ------------------------------------------------------------
+def draw_projected_box(ax, final_box_mesh):
+    if final_box_mesh is None:
+        return
+    tx_verts = np.asarray(final_box_mesh.vertices)
+    img_pts, _ = cv2.projectPoints(tx_verts, np.zeros(3), np.zeros(3), K_camera, D_dist)
+    img_pts = img_pts.reshape(-1, 2).astype(int)
+    lines = [
+        [0, 1], [1, 2], [2, 3], [3, 0],
+        [4, 5], [5, 6], [6, 7], [7, 4],
+        [0, 4], [1, 5], [2, 6], [3, 7]
+    ]
+    for s, e in lines:
+        ax.plot(
+            [img_pts[s, 0], img_pts[e, 0]],
+            [img_pts[s, 1], img_pts[e, 1]],
+            color='red', linewidth=1.5
+        )
+
+# ------------------------------------------------------------
+# 8. Obj2 포인트 클라우드 투영 시각화
+# ------------------------------------------------------------
+def draw_projected_obj2_points(ax, obj2_pts_cam, W, H):
+    """
+    obj2_pts_cam (Obj2 필터링된 3D 포인트)를 2D로 투영하여 이미지에 표시
+    """
+    if obj2_pts_cam is None or len(obj2_pts_cam) == 0:
+        return
+    
+    # 3D -> 2D 투영
+    img_pts, _ = cv2.projectPoints(
+        obj2_pts_cam, np.zeros(3), np.zeros(3), K_camera, D_dist
+    )
+    img_pts = img_pts.reshape(-1, 2)
+    
+    # 이미지 범위 내 포인트만 필터링
+    valid_mask = (
+        (img_pts[:, 0] >= 0) & (img_pts[:, 0] < W) &
+        (img_pts[:, 1] >= 0) & (img_pts[:, 1] < H)
+    )
+    img_pts_valid = img_pts[valid_mask]
+    
+    # 포인트 그리기 (초록색 작은 점)
+    if len(img_pts_valid) > 0:
+        ax.scatter(
+            img_pts_valid[:, 0], 
+            img_pts_valid[:, 1],
+            c='r' \
+            'ed',           # 밝은 초록색
+            s=10,                # 작은 점 크기
+            alpha=1.0,          # 반투명
+            marker='.',
+            edgecolors='none'
+        )
+        print(f"Drew {len(img_pts_valid)} obj2_pts_cam points on image")
+
+# ------------------------------------------------------------
+# 9. Pose + 측정값 텍스트
+# ------------------------------------------------------------
+def draw_pose_and_measurements(ax, estimated_param, measurement_record):
+    if estimated_param is None:
+        return
+
+    tx, ty, yaw, z = estimated_param
+    pose_text = (
+        f"6DOF Pose:\n"
+        f"Trans: ({tx:.2f}, {ty:.2f}, {z:.2f})m\n"
+        f"Rot: ({np.degrees(yaw):.1f})°\n"
+    )
+
+    if measurement_record is not None:
+        pose_text += (
+            f"Length: T={measurement_record['P1-P2']:.1f}mm "
+            f"B={measurement_record['P3-P4']:.1f}mm\n"
+            f"Width: T={measurement_record['P5-P6']:.1f}mm "
+            f"B={measurement_record['P7-P8']:.1f}mm"
+        )
+
+    ax.text(
+        20, 40, pose_text,
+        color='white', fontsize=10,
+        bbox=dict(facecolor='black', alpha=0.5)
+    )
+
+# ------------------------------------------------------------
+# 9. 프레임 저장
+# ------------------------------------------------------------
+def save_output_frame(fig, f_idx):
+    out_path = os.path.join(Config.OUTPUT_DIR, f"frame_{f_idx:05d}.jpg")
+    plt.savefig(out_path, dpi=TARGET_DPI, bbox_inches='tight', pad_inches=0)
+    plt.close(fig)
+
+# ------------------------------------------------------------
+# 10. 메인: process_single_frame (리팩토링 버전)
+# ------------------------------------------------------------
+def process_single_frame(
+    f_idx,
+    fname,
+    pcd_files,
+    video_segments,
+    obj_id_1,
+    obj_id_2,
+    last_successful_pose
+):
+    # 0) 프레임/figure 준비
+    img, fig, ax, W, H, img_path = load_and_prepare_frame(f_idx, fname)
+
+    # PCD 경로
+    pcd_path = os.path.join(Config.PCD_DIR, pcd_files[f_idx]) if f_idx < len(pcd_files) else None
+
+    # 마스크/박스
+    masks = video_segments.get(f_idx, {})
+    mask_obj1, mask_obj2, obj1_corners, obj2_rbox_corners = extract_masks_and_rboxes(
+        ax, masks, obj_id_1, obj_id_2, H, W
+    )
+
+    estimated_param = None
     final_box_mesh = None
     final_wireframe = None
     final_icp_points = None
     P_target_icp = None
     obj1_plane_mesh = None
     T_icp_final = np.identity(4)
-
     measurement_record = None
+    obj2_pts_cam = None  # obj2 포인트 클라우드 (2D 시각화용)
 
-    if obj1_corners is not None:
-        ordered_corners = order_points_for_model(obj1_corners)
-        initial_param = last_successful_pose.copy()
-
-        try:
-            # 2-1. LS Pose
-            res = least_squares(
-                cost_function, initial_param,
-                args=(model_points_3d_top, ordered_corners, K_camera, D_dist),
-                loss='soft_l1'
+    try:
+        # 1) Obj1 pose
+        if obj1_corners is not None:
+            estimated_param, last_successful_pose = estimate_pose_obj1(
+                obj1_corners, last_successful_pose
             )
-            estimated_param = res.x
-            last_successful_pose = estimated_param.copy()
 
-            T_icp_final = np.identity(4)
-            synthetic_plane_cloud = None
-            obj2_pts_cam = None
-            normal_obj2 = None
-            centroid_obj2 = None
+            # 2) Obj2 포인트 + rbox
+            obj2_pts_cam, mask_obj2, obj2_rbox_corners = prepare_obj2_points_and_rbox(
+                pcd_path, mask_obj2, obj_id_2, ax, H, W
+            )
 
-            # 2-2. Obj2 포인트 + 필터링
-            if pcd_path and os.path.exists(pcd_path) and mask_obj2 is not None:
-                pcd = o3d.io.read_point_cloud(pcd_path)
-                pts_l = np.asarray(pcd.points, dtype=np.float32)
-                pts_h = np.hstack([pts_l, np.ones((len(pts_l), 1), dtype=np.float32)])
-
-                P_full_cam = (T_l2c @ pts_h.T).T[:, :3]
-                obj2_pts_cam, mask_obj2_updated = filter_points_by_mask(
-                    P_full_cam, mask_obj2, K_camera, D_dist, W, H,
-                    depth_threshold=Config.DEPTH_TH, update_mask=True
+            # 3) 평면+ICP+박스
+            normal_obj2, centroid_obj2, synthetic_plane_cloud, \
+                T_icp_final, final_box_mesh, final_wireframe = fit_plane_and_icp_for_obj2(
+                    obj2_pts_cam, obj2_rbox_corners, estimated_param
                 )
-                print(f"   🔍 Obj2 filtered: {len(obj2_pts_cam)} points (depth < {Config.DEPTH_TH}m)")
-
-                if mask_obj2_updated is not None:
-                    mask_obj2 = mask_obj2_updated
-                    draw_mask_and_rbox(
-                        ax, mask_obj2, obj_id_2, "deepskyblue", H, W,
-                        Config.APPLY_EROSION, Config.EROSION_KERNEL_SIZE, Config.EROSION_ITERATIONS
-                    )
-                    mask_eroded_obj2 = apply_erosion(mask_obj2, Config.EROSION_KERNEL_SIZE, Config.EROSION_ITERATIONS) if Config.APPLY_EROSION else mask_obj2
-                    corners_updated, *_ = mask_to_rotated_box(mask_eroded_obj2)
-                    if corners_updated is not None:
-                        obj2_rbox_corners = corners_updated
-                        print(f"   🔄 Obj2 rbox updated with filtered mask")
-
-            # 2-3. Obj2 평면 + ICP
-            if obj2_rbox_corners is not None and obj2_pts_cam is not None and len(obj2_pts_cam) > 10:
-                normal_obj2, _, centroid_obj2, inlier_mask_obj2 = two_stage_plane_fit(obj2_pts_cam)
-
-                if normal_obj2 is not None:
-                    inlier_pts_obj2 = obj2_pts_cam[inlier_mask_obj2]
-                    if len(inlier_pts_obj2) > 3:
-                        centroid_obj2 = inlier_pts_obj2.mean(axis=0)
-
-                    synthetic_plane_cloud = generate_synthetic_plane_cloud(
-                        obj2_rbox_corners, normal_obj2, centroid_obj2, K_camera, D_dist
-                    )
-                    obj1_bottom_cloud = get_obj1_bottom_cloud(estimated_param)
-
-                    if synthetic_plane_cloud is not None and len(synthetic_plane_cloud) > 10:
-                        print(f"   🔌 Aligning Obj1 Bottom to Obj2 Plane (Target Pts: {len(synthetic_plane_cloud)})")
-                        T_icp_final = refine_pose_icp_constrained(
-                            obj1_bottom_cloud, synthetic_plane_cloud, max_iteration=30
-                        )
-                        print(f"   ✅ ICP Constrained Result:\n{T_icp_final}")
-                        delta_t = np.linalg.norm(T_icp_final[:3, 3])
-                        if delta_t > 1.0:
-                            print(f"   ⚠️ ICP Delta too large ({delta_t:.2f}m). Ignored.")
-                            T_icp_final = np.identity(4)
-
-            # 2-4. Box Mesh
-            base_mesh, base_wire = get_3d_box_mesh(estimated_param, color=[1, 0, 0])
-            base_mesh.transform(T_icp_final)
-            base_wire.transform(T_icp_final)
-            final_box_mesh = base_mesh
-            final_wireframe = base_wire
 
             if synthetic_plane_cloud is not None:
                 final_icp_points = synthetic_plane_cloud
 
-            # 3. 측정/그리기 (분리된 함수 호출)
-            if (
-                obj2_rbox_corners is not None
-                and len(obj2_rbox_corners) == 4
-                and normal_obj2 is not None
-                and centroid_obj2 is not None
-            ):
-                # 슬래브 코너 3D 복원
-                uv_pts = np.asarray(obj2_rbox_corners, dtype=np.float32).reshape(-1, 1, 2)
-                xy_undist = cv2.undistortPoints(uv_pts, K_camera, D_dist).squeeze()
+            # 4) 슬래브 3D 코너 복원
+            slab_corners_3d = reconstruct_slab_corners_3d(
+                obj2_rbox_corners, normal_obj2, centroid_obj2
+            )
 
-                slab_corners_3d = []
-                n = np.asarray(normal_obj2, dtype=np.float32)
-                n = n / (np.linalg.norm(n) + 1e-12)
-                p0 = np.asarray(centroid_obj2, dtype=np.float32)
-
-                for x_n, y_n in xy_undist:
-                    d_ray = np.array([x_n, y_n, 1.0], dtype=np.float32)
-                    d_ray = d_ray / np.linalg.norm(d_ray)
-                    denom = float(np.dot(n, d_ray))
-                    if abs(denom) < 1e-6:
-                        continue
-                    t = float(np.dot(n, p0) / denom)
-                    if t <= 0:
-                        continue
-                    P = d_ray * t
-                    slab_corners_3d.append(P)
-
-                if len(slab_corners_3d) == 4:
-                    slab_corners_3d = np.array(slab_corners_3d)
-                    measurement_record = compute_and_draw_measurements(
-                        ax,
-                        f_idx,
-                        np.asarray(final_box_mesh.vertices),
-                        slab_corners_3d,
-                        normal_obj2,
-                        centroid_obj2,
-                        T_icp_final,
-                        estimated_param
-                    )
-
-            # 4. 2D 박스 와이어프레임
-            if final_box_mesh is not None:
-                tx_verts = np.asarray(final_box_mesh.vertices)
-                img_pts, _ = cv2.projectPoints(tx_verts, np.zeros(3), np.zeros(3), K_camera, D_dist)
-                img_pts = img_pts.reshape(-1, 2).astype(int)
-                lines = [
-                    [0,1],[1,2],[2,3],[3,0],
-                    [4,5],[5,6],[6,7],[7,4],
-                    [0,4],[1,5],[2,6],[3,7]
-                ]
-                for s, e in lines:
-                    ax.plot(
-                        [img_pts[s, 0], img_pts[e, 0]],
-                        [img_pts[s, 1], img_pts[e, 1]],
-                        color='red', linewidth=1.5
-                    )
-
-            # 5. Pose 텍스트
-            if estimated_param is not None:
-                tx, ty, yaw, z = estimated_param
-                pose_text = (
-                    f"6DOF Pose:\n"
-                    f"Trans: ({tx:.2f}, {ty:.2f}, {z:.2f})m\n"
-                    f"Rot: ({np.degrees(yaw):.1f})°\n"
-                )
-                if measurement_record is not None:
-                    pose_text += (
-                        f"Length: T={measurement_record['P1-P2']:.1f}mm "
-                        f"B={measurement_record['P3-P4']:.1f}mm\n"
-                        f"Width: T={measurement_record['P5-P6']:.1f}mm "
-                        f"B={measurement_record['P7-P8']:.1f}mm"
-                    )
-                ax.text(
-                    20, 40, pose_text,
-                    color='white', fontsize=10,
-                    bbox=dict(facecolor='black', alpha=0.5)
+            # 5) 측정 + 2D draw
+            if slab_corners_3d is not None and final_box_mesh is not None:
+                measurement_record = compute_and_draw_measurements(
+                    ax,
+                    f_idx,
+                    np.asarray(final_box_mesh.vertices),
+                    slab_corners_3d,
+                    normal_obj2,
+                    centroid_obj2,
+                    T_icp_final,
+                    estimated_param
                 )
 
-        except Exception as e:
-            print(f"❌ Error frame {f_idx}: {e}")
-            traceback.print_exc()
+        # 6) obj2_pts_cam 포인트 투영 그리기
+        if obj2_pts_cam is not None:
+            draw_projected_obj2_points(ax, obj2_pts_cam, W, H)
 
-    # 6. 이미지 저장
-    out_path = os.path.join(Config.OUTPUT_DIR, f"frame_{f_idx:05d}.jpg")
-    plt.savefig(out_path, dpi=TARGET_DPI, bbox_inches='tight', pad_inches=0)
-    plt.close(fig)
+        # 7) 3D 박스 와이어프레임 2D에 그림
+        draw_projected_box(ax, final_box_mesh)
 
-    # 7. Open3D 시각화
+        # 8) Pose/측정 텍스트
+        draw_pose_and_measurements(ax, estimated_param, measurement_record)
+
+    except Exception as e:
+        print(f"❌ Error frame {f_idx}: {e}")
+        traceback.print_exc()
+
+    # 9) 이미지 저장
+    save_output_frame(fig, f_idx)
+
+    # 10) Open3D 시각화 (원래 로직 유지)
     if Config.SHOW_O3D and pcd_path and os.path.exists(pcd_path):
         pcd = o3d.io.read_point_cloud(pcd_path)
         visualize_full_3d(

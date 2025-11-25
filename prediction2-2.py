@@ -66,7 +66,7 @@ predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=device
 # 4. 경로 및 파라미터 설정
 # ========================================
 class Config:
-    ID = "202511250901568325"
+    ID = "202511201026498853"
     VIDEO_DIR = f"/workspace/sequences_sample/{ID}/image"
     PCD_DIR = f"/workspace/sequences_sample/{ID}/pcd"
     INTRINSIC_PATH = "/workspace/sam2/intrinsic.csv"
@@ -84,8 +84,8 @@ class Config:
     else :
         OBJ_1_POINTS = np.array([[1000, 450], [1000, 700], [1000, 575]], dtype=np.float32)
         OBJ_1_LABELS = np.array([1, 1, 0], dtype=np.int32)
-        OBJ_2_POINTS = np.array([[830, 490], [830, 670], [1124, 590],[1000, 450], [1000, 700]], dtype=np.float32)
-        OBJ_2_LABELS = np.array([1, 1, 1, 0, 0], dtype=np.int32)
+        OBJ_2_POINTS = np.array([[780, 330], [780, 811], [1000, 450], [1000, 700], [1000, 575]], dtype=np.float32)
+        OBJ_2_LABELS = np.array([1, 1, 0, 0, 0], dtype=np.int32)
     
     
     APPLY_EROSION = True
@@ -94,7 +94,7 @@ class Config:
     MAX_DEPTH = 15.0
     SHOW_O3D = False
 
-    ACWL_DZ = 3501
+    ACWL_DZ = 1856
     DEPTH_TH = 10 - (ACWL_DZ * 0.001) + 0.3
 
 os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
@@ -305,7 +305,7 @@ def filter_points_by_mask(points_3d_cam, mask, K, D, W, H, depth_threshold=None,
     # 3. Depth threshold 체크 (옵션)
     if depth_threshold is not None:
         depth_min = depth_threshold - depth_range
-        depth_max = depth_threshold + depth_range
+        depth_max = depth_threshold + 0.15
         depth_valid = (points_3d_cam[:, 2] >= depth_min) & (points_3d_cam[:, 2] <= depth_max)
     else:
         depth_valid = np.ones(len(points_3d_cam), dtype=bool)
@@ -998,7 +998,7 @@ last_successful_pose = np.array([0.0, 0.0, 0.0, 0.0])
 
 # 측정값 저장용 리스트
 measurement_records = []
-
+width_bottom_mm = None
 for f_idx, fname in enumerate(frame_names):
     img_path = os.path.join(Config.VIDEO_DIR, fname)
     pcd_path = os.path.join(Config.PCD_DIR, pcd_files[f_idx]) if f_idx < len(pcd_files) else None
@@ -1376,7 +1376,7 @@ for f_idx, fname in enumerate(frame_names):
             lines = [[0,1],[1,2],[2,3],[3,0], [4,5],[5,6],[6,7],[7,4], [0,4],[1,5],[2,6],[3,7]]
             for s, e in lines:
                 ax.plot([img_pts[s,0], img_pts[e,0]], [img_pts[s,1], img_pts[e,1]], color='red', linewidth=1.5)
-                
+            width_bottom_mm = width_bottom_mm if width_bottom_mm is not None else 0.0
             # Display 6DOF parameters + Measurements
             tx, ty, tz, theta = estimated_param
             pose_text = (

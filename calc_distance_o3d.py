@@ -139,8 +139,8 @@ def measure_distances(merged_pcd):
 
 def main():
     PCD_PATHS = [
-        "/home/myungw00/sam2_ws/sequences_sample/202511191815489071/pcd/frame_0000.pcd",
-        # "/path/to/pcd2.pcd",
+        '/workspace/sequences_sample/202511201026498853/pcd/0000.pcd',
+        # '/workspace/sequences_sample/202511201026498853/pcd/0004.pcd'
     ]
 
     # ---- Single or Multi PCD selection ----

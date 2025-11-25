@@ -7,10 +7,12 @@ import open3d as o3d
 # -------------------------------------------------------------------
 INTRINSIC_PATH = "/workspace/sam2/intrinsic.csv"
 EXTRINSIC_PATH = "/workspace/sam2/transform3_tuned_tuned.txt"
-IMAGE_PATH     = "/workspace/sequences_sample/202511230533537962/image/0004.jpg"
-PCD_PATH       = "/workspace/sequences_sample/202511230533537962/pcd/0004.pcd"
+IMAGE_PATH     = "/workspace/sequences_sample/202511201026498853/image/0004.jpg"
+PCD_PATH       = "/workspace/sequences_sample/202511201026498853/pcd/0004.pcd"
 
-MAX_DEPTH = 9.5
+ACWL_DZ = 1856  # mm, 카메라-라이다 수직 거리
+MAX_DEPTH = 10 - (ACWL_DZ * 0.001) + 0.5  # m
+# MAX_DEPTH = 8.5
 
 # -------------------------------------------------------------------
 # 1. 카메라 파라미터 로드 (질문에 주신 코드 그대로 사용)

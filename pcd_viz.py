@@ -66,7 +66,8 @@ def visualize_pcds(pcd_paths, axis="z", cmap_name="viridis"):
 
 if __name__ == '__main__':
     pcd_paths = [
-        '/workspace/sequences_sample/202511230533537962/pcd/0000.pcd'
+        '/workspace/sequences_sample/202511201026498853/pcd/0000.pcd',
+        '/workspace/sequences_sample/202511201026498853/pcd/0004.pcd'
     ]
 
     visualize_pcds(

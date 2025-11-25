@@ -19,7 +19,7 @@ import matplotlib.pyplot as plt
 from PIL import Image
 from matplotlib.patches import Polygon
 from scipy.optimize import least_squares
-
+import time
 # ========================================
 # 1. 환경 설정
 # ========================================
@@ -518,7 +518,7 @@ def filter_points_by_mask(points_3d_cam, mask, K, D, W, H, depth_threshold=None,
     # 3. Depth threshold 체크 (옵션)
     if depth_threshold is not None:
         depth_min = depth_threshold - depth_range
-        depth_max = depth_threshold + 0.2
+        depth_max = depth_threshold + 0.25
         depth_valid = (points_3d_cam[:, 2] >= depth_min) & (points_3d_cam[:, 2] <= depth_max)
     else:
         depth_valid = np.ones(len(points_3d_cam), dtype=bool)
@@ -1751,6 +1751,7 @@ def save_measurements_csv(measurement_records):
 
 
 def main():
+    start_time = time.time()
     """
     전체 스케줄 ID를 순회하며 각각에 대해 SAM2 추론 수행
     """
@@ -1807,14 +1808,17 @@ def main():
             traceback.print_exc()
             fail_count += 1
             continue
-    
+    end_time = time.time()
+    elapsed_time = end_time - start_time
     # 3. 최종 요약
     print("\n" + "="*60)
     print("🏁 Multi-Schedule Processing Complete")
     print("="*60)
     print(f"   ✅ Successful: {success_count}/{len(schedule_ids)}")
     print(f"   ❌ Failed: {fail_count}/{len(schedule_ids)}")
+    print(f"\n⏱️ Total processing time: {elapsed_time:.2f} seconds")
     print("="*60 + "\n")
+    
 
 
 if __name__ == "__main__":
