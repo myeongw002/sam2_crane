@@ -66,7 +66,7 @@ predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=device
 # 4. 경로 및 파라미터 설정
 # ========================================
 class Config:
-    ID = "202511201026498863"
+    ID = "202511250901568325"
     VIDEO_DIR = f"/workspace/sequences_sample/{ID}/image"
     PCD_DIR = f"/workspace/sequences_sample/{ID}/pcd"
     INTRINSIC_PATH = "/workspace/sam2/intrinsic.csv"
@@ -84,15 +84,18 @@ class Config:
     else :
         OBJ_1_POINTS = np.array([[1000, 450], [1000, 700], [1000, 575]], dtype=np.float32)
         OBJ_1_LABELS = np.array([1, 1, 0], dtype=np.int32)
-        OBJ_2_POINTS = np.array([[830, 490], [830, 670], [1000, 450], [1000, 700]], dtype=np.float32)
-        OBJ_2_LABELS = np.array([1, 1, 0, 0], dtype=np.int32)
+        OBJ_2_POINTS = np.array([[830, 490], [830, 670], [1124, 590],[1000, 450], [1000, 700]], dtype=np.float32)
+        OBJ_2_LABELS = np.array([1, 1, 1, 0, 0], dtype=np.int32)
     
-    DEPTH_TH = 8.8
+    
     APPLY_EROSION = True
     EROSION_KERNEL_SIZE = 9
     EROSION_ITERATIONS = 3
     MAX_DEPTH = 15.0
-    SHOW_O3D = True
+    SHOW_O3D = False
+
+    ACWL_DZ = 3501
+    DEPTH_TH = 10 - (ACWL_DZ * 0.001) + 0.3
 
 os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
 
@@ -268,7 +271,7 @@ def order_points_for_model(pts):
 
 
 
-def filter_points_by_mask(points_3d_cam, mask, K, D, W, H, depth_threshold=None, update_mask=False):
+def filter_points_by_mask(points_3d_cam, mask, K, D, W, H, depth_threshold=None, depth_range=0.1, update_mask=False):
     """
     3D 포인트(Camera Frame) 중 2D 마스크 내부에 위치한 포인트만 필터링
     
@@ -301,7 +304,9 @@ def filter_points_by_mask(points_3d_cam, mask, K, D, W, H, depth_threshold=None,
     
     # 3. Depth threshold 체크 (옵션)
     if depth_threshold is not None:
-        depth_valid = points_3d_cam[:, 2] <= depth_threshold
+        depth_min = depth_threshold - depth_range
+        depth_max = depth_threshold + depth_range
+        depth_valid = (points_3d_cam[:, 2] >= depth_min) & (points_3d_cam[:, 2] <= depth_max)
     else:
         depth_valid = np.ones(len(points_3d_cam), dtype=bool)
     
@@ -363,7 +368,7 @@ def refine_pose_icp_constrained(source_bottom_points, target_plane_points, max_i
     source.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamRadius(radius=search_radius))
     
     # 2. 일반 ICP 수행
-    threshold = 0.1
+    threshold = 0.2
     T_init = np.identity(4)
     
     reg = o3d.pipelines.registration.registration_icp(
@@ -1041,6 +1046,8 @@ for f_idx, fname in enumerate(frame_names):
     final_icp_points = None
     P_target_icp = None
     obj1_plane_mesh = None
+    normal_obj2 = None
+    centroid_obj2 = None
     T_icp_final = np.identity(4) # 기본값: 변환 없음
 
     # 2. Pose Optimization (Least Squares)
@@ -1426,25 +1433,28 @@ if len(measurement_records) > 0:
         for record in measurement_records:
             writer.writerow(record)
         
-        # 평균값 계산 및 추가
-        if len(measurement_records) > 0:
-            avg_len_top = np.mean([r['length_top_mm'] for r in measurement_records])
-            avg_len_bot = np.mean([r['length_bottom_mm'] for r in measurement_records])
-            avg_width_top = np.mean([r['width_top_mm'] for r in measurement_records])
-            avg_width_bot = np.mean([r['width_bottom_mm'] for r in measurement_records])
+        # 평균값 계산 및 추가 (첫 번째 프레임 제외)
+        if len(measurement_records) > 1:
+            # 첫 번째 프레임(인덱스 0) 제외하고 평균 계산
+            records_for_avg = measurement_records[1:]
+            avg_len_top = np.mean([r['length_top_mm'] for r in records_for_avg])
+            avg_len_bot = np.mean([r['length_bottom_mm'] for r in records_for_avg])
+            avg_width_top = np.mean([r['width_top_mm'] for r in records_for_avg])
+            avg_width_bot = np.mean([r['width_bottom_mm'] for r in records_for_avg])
             
             # 평균 행 추가
             writer.writerow({
                 'frame': 'AVERAGE',
-                'length_top_mm': f"{avg_len_top:.2f}",
-                'length_bottom_mm': f"{avg_len_bot:.2f}",
-                'width_top_mm': f"{avg_width_top:.2f}",
-                'width_bottom_mm': f"{avg_width_bot:.2f}"
+                'length_top_mm': f"{avg_len_top:.6f}",
+                'length_bottom_mm': f"{avg_len_bot:.6f}",
+                'width_top_mm': f"{avg_width_top:.6f}",
+                'width_bottom_mm': f"{avg_width_bot:.6f}"
             })
     
     print(f"\n📊 Measurements saved to: {csv_path}")
     print(f"   Total frames: {len(measurement_records)}")
-    print(f"   Average Length - Top: {avg_len_top:.2f}mm, Bottom: {avg_len_bot:.2f}mm")
-    print(f"   Average Width - Top: {avg_width_top:.2f}mm, Bottom: {avg_width_bot:.2f}mm")
+    if len(measurement_records) > 1:
+        print(f"   Average (excluding first frame) - Length Top: {avg_len_top:.6f}mm, Bottom: {avg_len_bot:.6f}mm")
+        print(f"   Average (excluding first frame) - Width Top: {avg_width_top:.6f}mm, Bottom: {avg_width_bot:.6f}mm")
 else:
     print("\n⚠️ No measurements recorded.")
