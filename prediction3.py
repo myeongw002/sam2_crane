@@ -352,6 +352,41 @@ def draw_mask_and_rbox(ax, mask_bool, oid, edge_color, H, W, apply_erosion_flag=
     
     return top_y, top_cx, bottom_y, bottom_cx, left_y, left_x, right_y, right_x
 
+def draw_projected_obj2_points(ax, obj2_pts_cam, W, H):
+    """
+    obj2_pts_cam (Obj2 필터링된 3D 포인트)를 2D로 투영하여 이미지에 표시
+    """
+    if obj2_pts_cam is None or len(obj2_pts_cam) == 0:
+        return
+    
+    # 3D -> 2D 투영
+    img_pts, _ = cv2.projectPoints(
+        obj2_pts_cam, np.zeros(3), np.zeros(3), K_camera, D_dist
+    )
+    img_pts = img_pts.reshape(-1, 2)
+    
+    # 이미지 범위 내 포인트만 필터링
+    valid_mask = (
+        (img_pts[:, 0] >= 0) & (img_pts[:, 0] < W) &
+        (img_pts[:, 1] >= 0) & (img_pts[:, 1] < H)
+    )
+    img_pts_valid = img_pts[valid_mask]
+    
+    # 포인트 그리기 (초록색 작은 점)
+    if len(img_pts_valid) > 0:
+        ax.scatter(
+            img_pts_valid[:, 0], 
+            img_pts_valid[:, 1],
+            c='r' \
+            'ed',           # 밝은 초록색
+            s=10,                # 작은 점 크기
+            alpha=1.0,          # 반투명
+            marker='.',
+            edgecolors='none'
+        )
+        print(f"Drew {len(img_pts_valid)} obj2_pts_cam points on image")
+
+
 
 
 # ========================================
