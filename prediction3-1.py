@@ -435,29 +435,42 @@ def order_points_for_model(pts):
     return rect
 
 
-def mask_from_minrect(point_mask, min_points=20):
+def mask_from_minrect(sparse_mask, min_points=10, padding_px=5):
     """
-    point_mask: bool(H, W), sparse 형태
-    → cv2.minAreaRect()로 외곽 Rotated Rectangle 생성 후 내부 fill
+    Args:
+        padding_px: 사각형을 외곽으로 확장할 픽셀 수 (예: 20px)
     """
-    H, W = point_mask.shape
-    ys, xs = np.where(point_mask)
-
-    # 포인트가 너무 적으면 신뢰 불가
+    ys, xs = np.where(sparse_mask)
+    
     if len(xs) < min_points:
-        return point_mask   # 그대로 반환
+        return np.zeros_like(sparse_mask, dtype=bool), None
 
-    pts = np.stack([xs, ys], axis=1).astype(np.float32)
+    points = np.column_stack([xs, ys]).astype(np.float32)
+    
+    # 1. 최소 외접 직사각형 계산
+    # rect = ((cx, cy), (w, h), angle)
+    rect = cv2.minAreaRect(points)
+    (cx, cy), (w, h), angle = rect
 
-    # 1) minAreaRect
-    rect = cv2.minAreaRect(pts)   # (center(x,y), (w,h), angle)
-    box  = cv2.boxPoints(rect).astype(int)  # 4 x 2
+    # 2. [보정] 크기 확장 (Padding 적용)
+    # w와 h에 각각 양쪽 패딩을 더해줍니다.
+    new_w = w + (padding_px * 2)
+    new_h = h + (padding_px * 2)
+    
+    # 보정된 Rect 생성
+    expanded_rect = ((cx, cy), (new_w, new_h), angle)
+    
+    # 3. Box 포인트 계산 및 그리기
+    box = cv2.boxPoints(expanded_rect)
+    box = np.int32(box)
 
-    # 2) box를 이용해 채운 mask 생성
-    filled = np.zeros((H, W), dtype=np.uint8)
-    cv2.fillPoly(filled, [box], 255)
-
-    return (filled > 0), box
+    H, W = sparse_mask.shape
+    solid_mask = np.zeros((H, W), dtype=np.uint8)
+    
+    # 채워진 다각형 그리기
+    cv2.fillPoly(solid_mask, [box], 1)
+    
+    return solid_mask.astype(bool), box
 
 
 
@@ -1676,7 +1689,8 @@ def prepare_obj2_points_and_rbox(
 
     # mask 업데이트 시 다시 RBox
     if mask_obj2_updated is not None:
-        mask_obj2 = mask_obj2_updated
+        final_mask = mask_obj2_updated & mask_obj2
+        mask_obj2 = final_mask
         draw_mask_and_rbox(
             ax, mask_obj2, obj_id_2, "deepskyblue", H, W,
             Config.APPLY_EROSION, Config.EROSION_KERNEL_SIZE, Config.EROSION_ITERATIONS
