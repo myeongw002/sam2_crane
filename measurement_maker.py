@@ -37,8 +37,10 @@ def find_measurement_files(root_dir):
     results = []
     for name in sorted(os.listdir(root_dir)):
         subdir = os.path.join(root_dir, name)
+        # print(f"[DEBUG] Checking subdir: {subdir}")
         if not os.path.isdir(subdir):
             continue
+        subdir = subdir + "/results"
         csv_path = os.path.join(subdir, "measurements.csv")
         if os.path.isfile(csv_path):
             results.append((name, csv_path))
@@ -153,8 +155,8 @@ def main():
 
     if not records:
         raise SystemExit("No valid AVERAGE rows were found.")
-
-    create_excel(args.root_dir+args.output, records)
+    output_path = args.root_dir + "/" + args.output
+    create_excel(output_path, records)
 
 
 if __name__ == "__main__":

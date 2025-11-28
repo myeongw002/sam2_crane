@@ -96,6 +96,7 @@ class Config:
     SHOW_O3D = False
 
     ACWL_DZ = None  # Will be loaded from results
+    DEPTH_OFSFSET = 0.35  # Depth offset in meters
     DEPTH_TH = None  # Will be calculated from ACWL_DZ
 
 def update_config(schedule_id, base_sequences_dir="/workspace/sequences_sample"):
@@ -107,7 +108,7 @@ def update_config(schedule_id, base_sequences_dir="/workspace/sequences_sample")
     Config.VIDEO_DIR = f"{Config.BASE_DIR}/image"
     Config.PCD_DIR = f"{Config.BASE_DIR}/pcd"
     Config.RESULTS_DIR = f"{Config.BASE_DIR}/results"
-    Config.OUTPUT_DIR = f"./all_sequences/{schedule_id}"
+    Config.OUTPUT_DIR = f"./all_sequences/{schedule_id}/results"
     
     # Obj2 프롬프트 초기화 (ML 모델로 나중에 대체됨)
     if not Config.REVERSED:
@@ -565,7 +566,7 @@ def filter_points_by_mask(points_3d_cam, mask, K, D, W, H,
     # 3. 깊이 범위 체크
     if depth_threshold is not None:
         depth_min = depth_threshold - depth_range
-        depth_max = depth_threshold + depth_range
+        depth_max = depth_threshold + 0.2
         depth_valid = (points_3d_cam[:, 2] >= depth_min) & (points_3d_cam[:, 2] <= depth_max)
     else:
         depth_valid = np.ones(len(points_3d_cam), dtype=bool)
@@ -1231,7 +1232,7 @@ def initialize_sam2_and_prompts():
 
     # Config 업데이트
     Config.ACWL_DZ = acwl_dz
-    Config.DEPTH_TH = 10 - (acwl_dz * 0.001) + 0.3
+    Config.DEPTH_TH = 10 - (acwl_dz * 0.001) + Config.DEPTH_OFSFSET
 
     # Obj1 자동 프롬프트
     Config.OBJ_1_POINTS = get_prompt_points_from_dz(acwl_dz)
@@ -1310,6 +1311,111 @@ def build_video_segments(inference_state):
     return video_segments
 
 
+def project_point_to_plane(P, n, p0):
+    """3D 점 P를 (n, p0)로 정의된 평면에 직교 사영."""
+    v = P - p0
+    dist = np.dot(v, n)
+    return P - dist * n
+
+def project_dir_to_plane(d, n):
+    """방향벡터 d를 평면에 평행한 성분만 남기도록 투영."""
+    d_proj = d - np.dot(d, n) * n
+    norm = np.linalg.norm(d_proj)
+    if norm < 1e-12:
+        return None
+    return d_proj / norm
+
+def intersect_line_with_segment_on_plane(P0, d, A, B, n):
+    """
+    평면 위에 있는 직선 L(s) = P0 + s*d 와
+    평면 위 선분 S(u) = A + u*(B-A), u∈[0,1] 의 교점 계산.
+
+    모든 점은 같은 평면 위에 있다고 가정하고,
+    법선 n의 절댓값이 가장 큰 축을 버린 후,
+    나머지 2축에서 2×2 연립방정식을 풀어 (s, u)를 구한다.
+    """
+    d = d.astype(float)
+    A = A.astype(float)
+    B = B.astype(float)
+    P0 = P0.astype(float)
+
+    # 버릴 축 선택
+    k = np.argmax(np.abs(n))
+    idx = [0, 1, 2]
+    idx.remove(k)
+    i, j = idx[0], idx[1]
+
+    e = B - A
+
+    M = np.array([
+        [d[i], -e[i]],
+        [d[j], -e[j]]
+    ], dtype=float)
+
+    rhs = np.array([
+        A[i] - P0[i],
+        A[j] - P0[j]
+    ], dtype=float)
+
+    det = np.linalg.det(M)
+    if abs(det) < 1e-12:
+        # 직선과 선분이 평행하거나 거의 평행
+        return None, None, None
+
+    s, u = np.linalg.solve(M, rhs)
+
+    # 선분 내부에 있는지 체크
+    if u < 0.0 or u > 1.0:
+        return None, None, None
+
+    P_int = P0 + s * d
+    return P_int, s, u
+
+def compute_closest_intersection_on_slab(P0, d, slab_corners_3d, n, p0):
+    """
+    시작점 P0에서 방향 d로 정의된 직선을 평면에 사영한 뒤,
+    그 사영 직선과 slab 4개 엣지의 교점 중
+    |s|가 최소인(가장 가까운) 교점을 반환.
+
+    Returns:
+        P_int (3,), s (float) or (None, None) if no intersection.
+    """
+    # 1) 직선 방향, 시작점 평면에 사영
+    d_plane = project_dir_to_plane(d, n)
+    if d_plane is None:
+        return None, None
+
+    P0_plane = project_point_to_plane(P0, n, p0)
+
+    # 2) slab 엣지들 정의
+    C0, C1, C2, C3 = slab_corners_3d
+    edges = [(C0, C1), (C1, C2), (C2, C3), (C3, C0)]
+    
+    # print(f"Edge length checks:")
+    # for A, B in edges:
+    #     print(f"  Edge {A} to {B}: length = {np.linalg.norm(B - A):.4f} m")
+
+    best_P = None
+    best_s = None
+    best_abs_s = np.inf
+
+    for A, B in edges:
+        P_int, s, u = intersect_line_with_segment_on_plane(P0_plane, d_plane, A, B, n)
+        if P_int is None:
+            continue
+        if abs(s) < best_abs_s:
+            best_abs_s = abs(s)
+            best_s = s
+            best_P = P_int
+
+    return best_P, best_s
+
+def project_point_to_plane(P, n, p0):
+    # n: unit normal
+    # p0: point on plane
+    d = np.dot(n, (P - p0))
+    return P - d * n
+
 def compute_and_draw_measurements(
     ax,
     f_idx,
@@ -1324,106 +1430,124 @@ def compute_and_draw_measurements(
     - 마그넷 박스(final_vertices)와 철판 코너(slab_corners_3d)를 이용해
       P1-P2, P3-P4, P5-P6, P7-P8 거리를 계산하고
       이미지를 기준으로 화살표 및 텍스트를 그린다.
-    - 측정 결과 dict를 반환한다.
+    - 길이·너비 모두 3D 직선 → 평면 사영 → 엣지 교점 → 3D 거리 방식으로 계산.
     """
-    # ========== 준비 ==========
-    # 슬래브 중심
-    slab_center = np.mean(slab_corners_3d[:, :2], axis=0)
+    print(f"\n========== compute_and_draw_measurements (frame {f_idx:03d}) ==========")
 
-    # 최종 박스 꼭짓점 (이름만 정리)
-    top_left_corner    = final_vertices[0]  # TL
-    bottom_left_corner = final_vertices[1]  # BL
+    # ---------------------------
+    # 기본 준비
+    # ---------------------------
+    n = normal_obj2.astype(float)
+    n = n / (np.linalg.norm(n) + 1e-12)
+    p0 = centroid_obj2.astype(float)
+
+    # final_vertices: ICP까지 적용된 마그넷 8개 꼭짓점 (카메라 좌표계)
+    # 인덱스: 0=TL, 1=BL, 2=BR, 3=TR, 4~7는 아래쪽
+    top_left_corner    = final_vertices[0]
+    bottom_left_corner = final_vertices[1]
+    bottom_right_corner= final_vertices[2]
+    top_right_corner   = final_vertices[3]
+
 
     # 마그넷 길이 방향 param (0~MAGNET_LENGTH)
     t1 = 0.7 / MAGNET_LENGTH
     t2 = (MAGNET_LENGTH - 0.7) / MAGNET_LENGTH
 
-    # 길이 측정 시작점 (3D)
-    measure_pt_top = top_left_corner + t1 * (bottom_left_corner - top_left_corner)
-    measure_pt_bot = top_left_corner + t2 * (bottom_left_corner - top_left_corner)
+    # 길이 측정 시작점 (3D, 좌측 에지 기준)
+    measure_pt_top1 = top_left_corner + t1 * (bottom_left_corner - top_left_corner)
+    measure_pt_bot1 = top_left_corner + t2 * (bottom_left_corner - top_left_corner)
 
-    # 회전 행렬 (Yaw + ICP)
-    yaw = estimated_param[2]
-    R_theta = np.array([
-        [np.cos(yaw), -np.sin(yaw), 0],
-        [np.sin(yaw),  np.cos(yaw), 0],
-        [0, 0, 1]
-    ])
-    R_icp = T_icp_final[:3, :3]
-    R_total = R_icp @ R_theta
+    # 우측 에지(참고용, 지금은 사용 안 함)
+    measure_pt_top2 = top_right_corner + t1 * (bottom_right_corner - top_right_corner)
+    measure_pt_bot2 = top_right_corner + t2 * (bottom_right_corner - top_right_corner)
 
-    # 길이 방향: 로컬 x축 → 월드
-    dir_world = R_total @ np.array([1.0, 0.0, 0.0])
-    measure_dir_2d = dir_world[:2]
-    measure_dir_2d /= (np.linalg.norm(measure_dir_2d) + 1e-12)
+    print(f"[DEBUG] measure_pt_top1 = {measure_pt_top1}")
+    print(f"[DEBUG] measure_pt_bot1 = {measure_pt_bot1}")
 
-    # 보조 함수: ray-line 거리
-    def ray_line_dist(start_pt, direction, p1, p2):
-        x1, y1 = start_pt
-        dx, dy = direction
-        x3, y3 = p1
-        x4, y4 = p2
-        denom = dx * (y3 - y4) - dy * (x3 - x4)
-        if abs(denom) < 1e-6:
-            return 0.0
-        t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
-        return abs(t)
+    # ---------------------------
+    # 1) 길이 측정 (Top / Bottom)
+    #    - 각 측정점에서 길이 방향 직선을 잡고
+    #    - 직선을 평면에 사영 후, slab 엣지와 교점
+    #    - 원래 측정점 ↔ 교점 3D 거리
+    # ---------------------------
+    end_pt_top_3d = measure_pt_top1
+    end_pt_bot_3d = measure_pt_bot1
+    len_top_mm = 0.0
+    len_bot_mm = 0.0
 
-    # ========== 길이 측정 엣지 선택 ==========
-    dots = np.dot(slab_corners_3d[:, :2] - slab_center, measure_dir_2d)
-    target_idx = np.argsort(dots)[-2:]
-    edge_p1 = slab_corners_3d[target_idx[0], :2]
-    edge_p2 = slab_corners_3d[target_idx[1], :2]
+    # 마그넷 축 방향 벡터 (순수 3D)
+    len_top_vec   = measure_pt_top1 - measure_pt_top2       # 길이 방향
+    width_top_vec = top_left_corner   - bottom_left_corner       # 너비 방향
+    len_bot_vec   = measure_pt_bot1 - measure_pt_bot2       # 길이 방향
+    width_bot_vec = top_right_corner   - bottom_right_corner       # 너비 방향
 
-    # 길이(위/아래) 계산
-    len_top_mm = ray_line_dist(measure_pt_top[:2], measure_dir_2d, edge_p1, edge_p2) * 1000.0
-    len_bot_mm = ray_line_dist(measure_pt_bot[:2], measure_dir_2d, edge_p1, edge_p2) * 1000.0
+    len_top_dir = len_top_vec / (np.linalg.norm(len_top_vec) + 1e-12)
+    width_top_dir = width_top_vec / (np.linalg.norm(width_top_vec) + 1e-12)
+    len_bot_dir = len_bot_vec / (np.linalg.norm(len_bot_vec) + 1e-12)
+    width_bot_dir = width_bot_vec / (np.linalg.norm(width_bot_vec) + 1e-12)
 
-    # ========== 너비 측정 (윗변) ==========
-    width_dir_world = R_total @ np.array([0.0, -1.0, 0.0])  # 로컬 -y
-    width_dir_2d = width_dir_world[:2]
-    width_dir_2d /= (np.linalg.norm(width_dir_2d) + 1e-12)
+    # Top 길이
+    P_int_top, s_top = compute_closest_intersection_on_slab(
+        measure_pt_top1, len_top_dir, slab_corners_3d, n, p0
+    )
+    if P_int_top is not None:
+        proj_top1 = project_point_to_plane(measure_pt_top1, n, p0)
+        len_top_mm = np.linalg.norm(P_int_top - proj_top1) * 1000.0
+        end_pt_top_3d = P_int_top
+    print(f"[DEBUG] Length Top (mm) = {len_top_mm:.3f}")
 
-    dots_width = np.dot(slab_corners_3d[:, :2] - slab_center, width_dir_2d)
-    target_idx_width = np.argsort(dots_width)[-2:]
-    edge_w1 = slab_corners_3d[target_idx_width[0], :2]
-    edge_w2 = slab_corners_3d[target_idx_width[1], :2]
+    # Bottom 길이
+    P_int_bot, s_bot = compute_closest_intersection_on_slab(
+        measure_pt_bot1, len_bot_dir, slab_corners_3d, n, p0
+    )
+    if P_int_bot is not None:
+        proj_bot1 = project_point_to_plane(measure_pt_bot1, n, p0)
+        len_bot_mm = np.linalg.norm(P_int_bot - proj_bot1) * 1000.0
+        end_pt_bot_3d = P_int_bot
+    print(f"[DEBUG] Length Bottom (mm) = {len_bot_mm:.3f}")
 
-    width_dist = ray_line_dist(top_left_corner[:2], width_dir_2d, edge_w1, edge_w2)
-    width_mm = width_dist * 1000.0
+    # ---------------------------
+    # 2) 너비 측정 (Top / Bottom)
+    #    - Top: top_left에서 width_dir 방향
+    #    - Bottom: bottom_left에서 width_dir 방향
+    # ---------------------------
+    end_pt_width_top_3d = top_left_corner
+    end_pt_width_bottom_3d = bottom_left_corner
+    width_top_mm = 0.0
+    width_bottom_mm = 0.0
 
-    # ========== 너비 측정 (아랫변) ==========
-    width_bottom_dir_world = R_total @ np.array([0.0, 1.0, 0.0])  # 로컬 +y
-    width_bottom_dir_2d = width_bottom_dir_world[:2]
-    width_bottom_dir_2d /= (np.linalg.norm(width_bottom_dir_2d) + 1e-12)
+    # Width Top
+    P_int_wtop, s_wtop = compute_closest_intersection_on_slab(
+        top_left_corner, width_top_dir, slab_corners_3d, n, p0
+    )
+    if P_int_wtop is not None:
+        proj_wtop = project_point_to_plane(top_left_corner, n, p0)
+        width_top_mm = np.linalg.norm(P_int_wtop - proj_wtop) * 1000.0
+        end_pt_width_top_3d = P_int_wtop
+    print(f"[DEBUG] Width Top (mm) = {width_top_mm:.3f}")
 
-    dots_width_bottom = np.dot(slab_corners_3d[:, :2] - slab_center, width_bottom_dir_2d)
-    target_idx_width_bottom = np.argsort(dots_width_bottom)[-2:]
-    edge_wb1 = slab_corners_3d[target_idx_width_bottom[0], :2]
-    edge_wb2 = slab_corners_3d[target_idx_width_bottom[1], :2]
+    # Width Bottom
+    P_int_wbot, s_wbot = compute_closest_intersection_on_slab(
+        bottom_left_corner, width_bot_dir, slab_corners_3d, n, p0
+    )
+    if P_int_wbot is not None:
+        proj_wbot = project_point_to_plane(bottom_left_corner, n, p0)
+        width_bottom_mm = np.linalg.norm(P_int_wbot - proj_wbot) * 1000.0
+        end_pt_width_bottom_3d = P_int_wbot
+    print(f"[DEBUG] Width Bottom (mm) = {width_bottom_mm:.3f}")
 
-    width_bottom_dist = ray_line_dist(bottom_left_corner[:2], width_bottom_dir_2d, edge_wb1, edge_wb2)
-    width_bottom_mm = width_bottom_dist * 1000.0
-
-    print(f"   📏 Length Top: {len_top_mm:.1f}mm, Bottom: {len_bot_mm:.1f}mm")
-    print(f"   📐 Width Top: {width_mm:.1f}mm, Bottom: {width_bottom_mm:.1f}mm")
-
-    # ========== 3D → 2D 투영 후 화살표/텍스트 그리기 ==========
-    # 끝점 3D 계산
-    end_pt_top_3d  = measure_pt_top  + dir_world * (len_top_mm / 1000.0)
-    end_pt_bot_3d  = measure_pt_bot  + dir_world * (len_bot_mm / 1000.0)
-    end_pt_width_3d        = top_left_corner    + width_dir_world        * (width_mm / 1000.0)
-    end_pt_width_bottom_3d = bottom_left_corner + width_bottom_dir_world * (width_bottom_mm / 1000.0)
-
+    # ---------------------------
+    # 3) 3D → 2D 투영 (시각화용)
+    # ---------------------------
     pts_to_project = np.array([
-        measure_pt_top,          # 0
-        measure_pt_bot,          # 1
-        top_left_corner,         # 2
-        bottom_left_corner,      # 3
-        end_pt_top_3d,           # 4
-        end_pt_bot_3d,           # 5
-        end_pt_width_3d,         # 6
-        end_pt_width_bottom_3d   # 7
+        measure_pt_top1,          # 0
+        measure_pt_bot1,          # 1
+        top_left_corner,          # 2
+        bottom_left_corner,       # 3
+        end_pt_top_3d,            # 4
+        end_pt_bot_3d,            # 5
+        end_pt_width_top_3d,      # 6
+        end_pt_width_bottom_3d    # 7
     ])
 
     img_measure_pts, _ = cv2.projectPoints(
@@ -1440,6 +1564,10 @@ def compute_and_draw_measurements(
     p_end_bot          = img_measure_pts[5]
     p_end_width        = img_measure_pts[6]
     p_end_width_bottom = img_measure_pts[7]
+
+    # ---------------------------
+    # 4) 2D 화살표 및 텍스트 그리기
+    # ---------------------------
 
     # 길이 위쪽 (노란색)
     ax.plot(p_start_top[0], p_start_top[1], 'o', color='yellow', markersize=6, markeredgecolor='black')
@@ -1472,7 +1600,7 @@ def compute_and_draw_measurements(
                 arrowprops=dict(arrowstyle='->', color='magenta', lw=2, shrinkA=0, shrinkB=0))
     mid_width = (p_start_width + p_end_width) / 2
     ax.text(
-        mid_width[0] - 40, mid_width[1], f'{width_mm:.0f}mm',
+        mid_width[0] - 40, mid_width[1], f'{width_top_mm:.0f}mm',
         color='magenta', fontsize=9, weight='bold', ha='right',
         bbox=dict(boxstyle='round,pad=0.2', facecolor='black', alpha=0.6)
     )
@@ -1489,15 +1617,19 @@ def compute_and_draw_measurements(
         bbox=dict(boxstyle='round,pad=0.2', facecolor='black', alpha=0.6)
     )
 
-    # CSV용 레코드 반환
+    # ---------------------------
+    # 5) CSV용 레코드 반환
+    # ---------------------------
     measurement_record = {
         'frame': f_idx,
         'P1-P2': len_top_mm,
         'P3-P4': len_bot_mm,
-        'P5-P6': width_mm,
+        'P5-P6': width_top_mm,
         'P7-P8': width_bottom_mm
     }
+    print(f"[DEBUG] measurement_record = {measurement_record}")
     return measurement_record
+
 
 
 def load_and_prepare_frame(f_idx, fname):
@@ -1973,7 +2105,7 @@ def main():
     print("="*60)
     
     # 1. 모든 스케줄 ID 가져오기
-    base_sequences_dir = "/workspace/sequences_sample/20251123"
+    base_sequences_dir = "/workspace/sequences_sample/20251127"
     print(f"\n📂 Scanning directory: {base_sequences_dir}")
     schedule_ids = get_all_schedule_ids(base_sequences_dir)
     

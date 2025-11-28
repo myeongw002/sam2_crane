@@ -139,7 +139,7 @@ def measure_distances(merged_pcd):
 
 def main():
     PCD_PATHS = [
-        '/workspace/sequences_sample/202511201026498853/pcd/0000.pcd',
+        '/workspace/sequences_sample/202511270905601479/pcd/0000.pcd',
         # '/workspace/sequences_sample/202511201026498853/pcd/0004.pcd'
     ]
 

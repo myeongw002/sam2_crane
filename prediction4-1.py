@@ -6,6 +6,7 @@ SAM2 Video Predictor + Full 3D Visualization
 import os
 import sys
 import csv
+import copy
 import traceback
 import re
 import glob
@@ -68,15 +69,20 @@ predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=device
 # 4. 경로 및 파라미터 설정
 # ========================================
 class Config:
-    ID = "202511270905601477"
-    BASE_DIR = f"/workspace/sequences_sample/{ID}"
-    VIDEO_DIR = f"{BASE_DIR}/image"
-    PCD_DIR = f"{BASE_DIR}/pcd"
-    RESULTS_DIR = f"{BASE_DIR}/results"
+    # 기본값 설정 (실행 시 update_config로 업데이트됨)
+    RUN_TAG = None
+    BASE_OUTPUT_ROOT = "./all_runs"
+    ID = None
+    BASE_DIR = None
+    VIDEO_DIR = None
+    PCD_DIR = None
+    RESULTS_DIR = None
     INTRINSIC_PATH = "/workspace/sam2/intrinsic.csv"
     EXTRINSIC_PATH = "/workspace/sam2/transform3_tuned_tuned.txt"
-    OUTPUT_DIR = f"./frame_out_full_vis/{ID}/"
-    
+    OUTPUT_DIR = None
+    PARAM_W = 5
+    PARAM_H = 5 
+    PARAM_TAG = "default"
     REVERSED = True
     
     # Obj1 프롬프트: DZ 기반 자동 생성 (나중에 업데이트)
@@ -84,13 +90,8 @@ class Config:
     OBJ_1_LABELS = np.array([1, 1, 0], dtype=np.int32)  # 3 positive prompts
     
     # Obj2 프롬프트 (고정)
-    if not REVERSED :
-        OBJ_2_POINTS = np.array([[820, 270], [820, 800]], dtype=np.float32)
-        OBJ_2_LABELS = np.array([1, 1], dtype=np.int32)
-    else :
-        OBJ_2_POINTS = np.array([[830, 490], [830, 670]], dtype=np.float32)
-        OBJ_2_LABELS = np.array([1, 1], dtype=np.int32)
-    
+    OBJ_2_POINTS = None
+    OBJ_2_LABELS = None
     
     APPLY_EROSION = True
     EROSION_KERNEL_SIZE = 9
@@ -99,10 +100,82 @@ class Config:
     SHOW_O3D = False
 
     ACWL_DZ = None  # Will be loaded from results
-    DEPTH_OFFSET = 0.35
+    DEPTH_OFSFSET = 0.35  # Depth offset in meters
     DEPTH_TH = None  # Will be calculated from ACWL_DZ
 
-os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
+def update_config(schedule_id,
+                  base_sequences_dir="/workspace/sequences_sample/20251127",
+                  run_tag="001",
+                  param_tag="default"):
+    """
+    스케줄 ID + 실행(run_tag) + 파라미터 태그(param_tag)에 맞게 경로/프롬프트 설정
+    """
+
+    Config.ID = schedule_id
+    Config.RUN_TAG = run_tag
+    Config.PARAM_TAG = param_tag
+
+    # 입력 데이터 경로
+    Config.BASE_DIR  = f"{base_sequences_dir}/{schedule_id}"
+    Config.VIDEO_DIR = f"{Config.BASE_DIR}/image"
+    Config.PCD_DIR   = f"{Config.BASE_DIR}/pcd"
+    Config.RESULTS_DIR = f"{Config.BASE_DIR}/results"  # 원본 결과 폴더 있으면 사용
+
+    # 출력 경로: ./all_runs/<param_tag>/<run_tag>/<schedule_id>/results
+    Config.OUTPUT_DIR = os.path.join(
+        Config.BASE_OUTPUT_ROOT,
+        Config.PARAM_TAG,
+        Config.RUN_TAG,
+        schedule_id,
+        "results"
+    )
+    os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
+
+    # 프롬프트(예시, 기존 코드 유지)
+    if not Config.REVERSED:
+        Config.OBJ_2_POINTS = np.array([[820, 270], [820, 800]], dtype=np.float32)
+        Config.OBJ_2_LABELS = np.array([1, 1], dtype=np.int32)
+    else:
+        Config.OBJ_2_POINTS = np.array([[830, 490], [830, 670]], dtype=np.float32)
+        Config.OBJ_2_LABELS = np.array([1, 1], dtype=np.int32)
+
+    print(f"\n{'='*60}")
+    print(f"Config updated for Schedule ID: {schedule_id}")
+    print(f"   Param Tag : {Config.PARAM_TAG}")
+    print(f"   Run Tag   : {Config.RUN_TAG}")
+    print(f"   Video Dir : {Config.VIDEO_DIR}")
+    print(f"   PCD Dir   : {Config.PCD_DIR}")
+    print(f"   Output Dir: {Config.OUTPUT_DIR}")
+    print(f"{'='*60}\n")
+
+
+def get_all_schedule_ids(base_dir="/workspace/sequences_sample"):
+    """
+    sequences_sample 디렉토리에서 모든 스케줄 ID를 추출
+    각 스케줄 ID는 image, pcd, results 하위 디렉토리를 가져야 함
+    """
+    if not os.path.exists(base_dir):
+        print(f"⚠️ Base directory not found: {base_dir}")
+        return []
+    
+    schedule_ids = []
+    for item in sorted(os.listdir(base_dir)):
+        item_path = os.path.join(base_dir, item)
+        if not os.path.isdir(item_path):
+            continue
+        
+        # image, pcd, results 디렉토리 존재 여부 확인
+        has_image = os.path.isdir(os.path.join(item_path, "image"))
+        has_pcd = os.path.isdir(os.path.join(item_path, "pcd"))
+        has_results = os.path.isdir(os.path.join(item_path, "results"))
+        
+        if has_image and has_pcd and has_results:
+            schedule_ids.append(item)
+            print(f"   ✅ Found valid schedule: {item}")
+        else:
+            print(f"   ⚠️ Skipping {item} (missing subdirectories)")
+    
+    return schedule_ids
 
 # ========================================
 # 5. 프롬프트 예측 함수 (ML Model 기반)
@@ -131,7 +204,7 @@ def parse_txt_full(path):
     L = int(L_match.group(1))
     return dz, w, L
 
-def predict_obj2_prompts(schedule_id, n_points=N_POINTS_OBJ2):
+def predict_obj2_prompts(schedule_id, results_dir, n_points=N_POINTS_OBJ2):
     """
     ML 모델을 사용하여 OBJ_2 프롬프트 자동 예측
     
@@ -158,8 +231,7 @@ def predict_obj2_prompts(schedule_id, n_points=N_POINTS_OBJ2):
         return None
     
     # Results 디렉토리에서 첫 번째 txt 파일 찾기
-    base_dir = f"/workspace/sequences_sample/{schedule_id}"
-    results_dir = os.path.join(base_dir, "results")
+    results_dir = results_dir
     
     if not os.path.exists(results_dir):
         print(f"   ⚠️ Results 디렉토리 없음: {results_dir}")
@@ -287,7 +359,7 @@ K_camera, D_dist, T_l2c = load_camera_params(Config.INTRINSIC_PATH, Config.EXTRI
 def show_mask(mask, ax, obj_id=None, random_color=False):
     """마스크 시각화"""
     if random_color:
-        color = np.concatenate([np.random.random(3), np.array([0.3])], axis=0)
+        color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
     else:
         cmap = plt.get_cmap("tab10")
         cmap_idx = 0 if obj_id is None else obj_id
@@ -372,7 +444,6 @@ model_points_2d = np.array([
     [MAGNET_WIDTH, 0.0]     # Point 3: TR
 ], dtype=np.float32)
 
-
 model_points_3d_top = np.hstack([model_points_2d, np.zeros((4, 1))])
 
 def affine_matrix(param):
@@ -435,7 +506,8 @@ def order_points_for_model(pts):
     return rect
 
 
-def mask_from_minrect(sparse_mask, min_points=10, padding_px=5):
+
+def mask_from_minrect(sparse_mask, min_points=10, w_pad=5, h_pad=5):
     """
     Args:
         padding_px: 사각형을 외곽으로 확장할 픽셀 수 (예: 20px)
@@ -443,7 +515,6 @@ def mask_from_minrect(sparse_mask, min_points=10, padding_px=5):
     ys, xs = np.where(sparse_mask)
     
     if len(xs) < min_points:
-        print(f"[WARN] Not enough points for minAreaRect: {len(xs)} < {min_points}")
         return np.zeros_like(sparse_mask, dtype=bool), None
 
     points = np.column_stack([xs, ys]).astype(np.float32)
@@ -455,8 +526,8 @@ def mask_from_minrect(sparse_mask, min_points=10, padding_px=5):
 
     # 2. [보정] 크기 확장 (Padding 적용)
     # w와 h에 각각 양쪽 패딩을 더해줍니다.
-    new_w = w #+ (padding_px * 2)
-    new_h = h + (padding_px * 2)
+    new_w = w + w_pad
+    new_h = h + h_pad
     
     # 보정된 Rect 생성
     expanded_rect = ((cx, cy), (new_w, new_h), angle)
@@ -472,88 +543,6 @@ def mask_from_minrect(sparse_mask, min_points=10, padding_px=5):
     cv2.fillPoly(solid_mask, [box], 1)
     
     return solid_mask.astype(bool), box
-
-def mask_from_quadrilateral(sparse_mask,
-                            min_points=10,
-                            epsilon_ratio=0.02,
-                            max_iter=10,
-                            dilate_px=3):
-    """
-    sparse_mask에서 True인 점들을 기반으로
-    - convex hull 계산
-    - approxPolyDP로 4변 다각형(사각형)으로 근사
-    하여 마스크 생성.
-
-    Args:
-        sparse_mask: bool 배열 (H, W)
-        min_points: 최소 포인트 개수. 이보다 적으면 빈 마스크 반환
-        epsilon_ratio: arcLength * epsilon_ratio 를 approxPolyDP의 초기 epsilon으로 사용
-        max_iter: epsilon을 조정하며 4점 맞추기 시도하는 최대 반복 횟수
-        dilate_px: 생성된 사각형 마스크를 팽창시킬 픽셀 수 (0이면 팽창 안함)
-
-    Returns:
-        solid_mask: bool (H, W), 4변 다각형 영역만 True
-        quad_pts: (4, 2) int32, 사각형 꼭짓점 (시계/반시계 순서)
-                  4점 근사 실패 시 None
-    """
-    ys, xs = np.where(sparse_mask)
-
-    if len(xs) < min_points:
-        print(f"[WARN] Not enough points for quadrilateral: {len(xs)} < {min_points}")
-        return np.zeros_like(sparse_mask, dtype=bool), None
-
-    H, W = sparse_mask.shape
-
-    # 1. 포인트 모음
-    points = np.column_stack([xs, ys]).astype(np.float32)  # (N,2)
-
-    # 2. Convex Hull
-    hull = cv2.convexHull(points)  # (M,1,2)
-    peri = cv2.arcLength(hull, True)
-
-    # 3. approxPolyDP로 4점 맞추기 시도
-    eps = epsilon_ratio * peri
-    quad = None
-
-    for i in range(max_iter):
-        approx = cv2.approxPolyDP(hull, eps, True)  # (K,1,2)
-        k = len(approx)
-
-        if k == 4:
-            quad = approx.reshape(-1, 2)
-            break
-
-        # 점이 너무 많으면 -> epsilon 키운다 (더 단순화)
-        if k > 4:
-            eps *= 1.5
-        # 점이 너무 적으면 -> epsilon 줄인다 (덜 단순화)
-        elif k < 4:
-            eps *= 0.7
-
-    if quad is None or len(quad) != 4:
-        print(f"[WARN] Failed to approximate 4-point polygon (got {len(approx)} points). "
-              f"Fallback to convex hull fill.")
-        # 실패 시: hull 전체를 마스크로 사용 (또는 여기서 minAreaRect / bbox로 대체 가능)
-        solid_mask = np.zeros((H, W), dtype=np.uint8)
-        cv2.fillPoly(solid_mask, [hull.astype(np.int32)], 1)
-        if dilate_px > 0:
-            ksize = 2 * dilate_px + 1
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
-            solid_mask = cv2.dilate(solid_mask, kernel, iterations=1)
-        return solid_mask.astype(bool), None
-
-    # 4. 4점 사각형을 마스크로 채우기
-    solid_mask = np.zeros((H, W), dtype=np.uint8)
-    quad_int = quad.astype(np.int32)
-    cv2.fillPoly(solid_mask, [quad_int], 1)
-
-    # 5. 팽창 옵션
-    if dilate_px > 0:
-        ksize = 2 * dilate_px + 1
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
-        solid_mask = cv2.dilate(solid_mask, kernel, iterations=1)
-
-    return solid_mask.astype(bool), quad_int
 
 
 
@@ -595,14 +584,12 @@ def filter_points_by_mask(points_3d_cam, mask, K, D, W, H,
 
     # 2. 이미지 범위 체크
     valid_uv = (u >= 0) & (u < W) & (v >= 0) & (v < H)
-    print(f"[INFO] UV valid count: {np.sum(valid_uv)} / {len(points_3d_cam)}")
+
     # 3. 깊이 범위 체크
     if depth_threshold is not None:
         depth_min = depth_threshold - depth_range
         depth_max = depth_threshold + 0.2
         depth_valid = (points_3d_cam[:, 2] >= depth_min) & (points_3d_cam[:, 2] <= depth_max)
-        print(f"[INFO] Depth filtering: {depth_min:.2f}m ~ {depth_max:.2f}m")
-        print(f"[INFO] Depth valid count: {np.sum(depth_valid)} / {len(points_3d_cam)}")
     else:
         depth_valid = np.ones(len(points_3d_cam), dtype=bool)
 
@@ -637,7 +624,9 @@ def filter_points_by_mask(points_3d_cam, mask, K, D, W, H,
         # === 핵심 변경점: minAreaRect 방식 적용 ===
         updated_mask_solid, minrect_pts = mask_from_minrect(
             updated_mask_sparse,
-            min_points=30    # 필요시 조정
+            min_points=30,    # 필요시 조정
+            w_pad=Config.PARAM_W,
+            h_pad=Config.PARAM_H
         )
 
         print(f"[INFO] mask rebuilt via minAreaRect. area={updated_mask_solid.sum()} pixels")
@@ -646,7 +635,6 @@ def filter_points_by_mask(points_3d_cam, mask, K, D, W, H,
     else:
         print(f"mask not updated")
         return filtered_points
-
 
 
 def refine_pose_icp_constrained(source_bottom_points, target_plane_points, max_iteration=30):
@@ -670,7 +658,7 @@ def refine_pose_icp_constrained(source_bottom_points, target_plane_points, max_i
     source.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamRadius(radius=search_radius))
     
     # 2. 일반 ICP 수행
-    threshold = 0.3
+    threshold = 0.2
     T_init = np.identity(4)
     
     reg = o3d.pipelines.registration.registration_icp(
@@ -1008,6 +996,7 @@ def calculate_length_measurements(magnet_pose, slab_corners_3d):
     # 위쪽 측정점 (P1): X=0.45, Y = 0.7 (700mm)
     # 아래쪽 측정점 (P2): X=0.45, Y = 2.25 - 0.7 (1.55m)
     # 측정 방향 (Normal): X축 양의 방향 (1, 0, 0) -> 그림상 오른쪽 화살표
+    
     local_p1 = np.array([MAGNET_WIDTH, 0.7, 0.0])
     local_p2 = np.array([MAGNET_WIDTH, MAGNET_LENGTH - 0.7, 0.0])
     
@@ -1255,43 +1244,38 @@ TARGET_DPI = 100
 
 def initialize_sam2_and_prompts():
     """DZ 파싱 + Obj1/Obj2 프롬프트 구성 + SAM2 state 초기화 + 파일 목록 반환"""
-    print("\n" + "="*50)
-    print("Initializing SAM2 inference state...")
-    print("="*50)
+    print("\n   🔧 Initializing SAM2 inference state...")
 
-    print("\n" + "="*50)
-    print("Generating automatic prompts from DZ value...")
-    print("="*50)
+    print("\n   🎯 Generating automatic prompts from DZ value...")
 
     # DZ 값 파싱
     acwl_dz = parse_dz_from_results(Config.RESULTS_DIR, frame_idx=0)
     if acwl_dz is None:
-        print("   ⚠️ DZ not found in results, using default 972mm")
+        print("      ⚠️ DZ not found in results, using default 972mm")
         acwl_dz = 972
 
     # Config 업데이트
     Config.ACWL_DZ = acwl_dz
-
-    Config.DEPTH_TH = 10 - (acwl_dz * 0.001) + Config.DEPTH_OFFSET
+    Config.DEPTH_TH = 10 - (acwl_dz * 0.001) + Config.DEPTH_OFSFSET
 
     # Obj1 자동 프롬프트
     Config.OBJ_1_POINTS = get_prompt_points_from_dz(acwl_dz)
-    print(f"   🎯 Auto-generated OBJ_1 prompts from DZ={acwl_dz}mm:")
-    print(f"      Point 1: ({Config.OBJ_1_POINTS[0][0]:.1f}, {Config.OBJ_1_POINTS[0][1]:.1f})")
-    print(f"      Point 2: ({Config.OBJ_1_POINTS[1][0]:.1f}, {Config.OBJ_1_POINTS[1][1]:.1f})")
-    print(f"      Point 3: ({Config.OBJ_1_POINTS[2][0]:.1f}, {Config.OBJ_1_POINTS[2][1]:.1f})")
+    print(f"      ✅ Auto-generated OBJ_1 prompts from DZ={acwl_dz}mm:")
+    print(f"         Point 1: ({Config.OBJ_1_POINTS[0][0]:.1f}, {Config.OBJ_1_POINTS[0][1]:.1f})")
+    print(f"         Point 2: ({Config.OBJ_1_POINTS[1][0]:.1f}, {Config.OBJ_1_POINTS[1][1]:.1f})")
+    print(f"         Point 3: ({Config.OBJ_1_POINTS[2][0]:.1f}, {Config.OBJ_1_POINTS[2][1]:.1f})")
 
     # Obj2 프롬프트 (ML)
-    print(f"\n   🤖 Predicting OBJ_2 prompts using ML model...")
-    obj2_predicted = predict_obj2_prompts(Config.ID, n_points=N_POINTS_OBJ2)
+    print(f"\n      🤖 Predicting OBJ_2 prompts using ML model...")
+    obj2_predicted = predict_obj2_prompts(Config.ID, Config.RESULTS_DIR, n_points=N_POINTS_OBJ2)
 
     if obj2_predicted is not None:
-        print(f"   ✅ ML prediction successful ({len(obj2_predicted)} points):")
+        print(f"      ✅ ML prediction successful ({len(obj2_predicted)} points):")
         for i, pt in enumerate(obj2_predicted, 1):
-            print(f"      Point {i}: ({pt[0]:.1f}, {pt[1]:.1f})")
+            print(f"         Point {i}: ({pt[0]:.1f}, {pt[1]:.1f})")
         obj2_positive_points = obj2_predicted
     else:
-        print(f"   ⚠️ ML prediction failed, using default fixed prompts")
+        print(f"      ⚠️ ML prediction failed, using default fixed prompts")
         obj2_positive_points = Config.OBJ_2_POINTS
 
     # Obj1을 Obj2의 negative 프롬프트로 추가
@@ -1302,9 +1286,9 @@ def initialize_sam2_and_prompts():
         dtype=np.int32
     )
 
-    print(f"   🎯 Final OBJ_2 prompts (including OBJ_1 as negative):")
-    print(f"      Positive: {len([l for l in Config.OBJ_2_LABELS if l == 1])} points")
-    print(f"      Negative: {len([l for l in Config.OBJ_2_LABELS if l == 0])} points (includes OBJ_1)")
+    print(f"      📋 Final OBJ_2 prompts (including OBJ_1 as negative):")
+    print(f"         Positive: {len([l for l in Config.OBJ_2_LABELS if l == 1])} points")
+    print(f"         Negative: {len([l for l in Config.OBJ_2_LABELS if l == 0])} points")
 
     # SAM2 state 초기화
     inference_state = predictor.init_state(video_path=Config.VIDEO_DIR)
@@ -1334,6 +1318,8 @@ def initialize_sam2_and_prompts():
         p for p in os.listdir(Config.PCD_DIR)
         if p.endswith('.pcd')
     ])
+
+    print(f"      📁 Found {len(frame_names)} images and {len(pcd_files)} PCD files")
 
     return inference_state, frame_names, pcd_files, obj_id_1, obj_id_2
 
@@ -1429,9 +1415,9 @@ def compute_closest_intersection_on_slab(P0, d, slab_corners_3d, n, p0):
     C0, C1, C2, C3 = slab_corners_3d
     edges = [(C0, C1), (C1, C2), (C2, C3), (C3, C0)]
     
-    print(f"Edge length checks:")
-    for A, B in edges:
-        print(f"  Edge {A} to {B}: length = {np.linalg.norm(B - A):.4f} m")
+    # print(f"Edge length checks:")
+    # for A, B in edges:
+    #     print(f"  Edge {A} to {B}: length = {np.linalg.norm(B - A):.4f} m")
 
     best_P = None
     best_s = None
@@ -1970,9 +1956,7 @@ def save_output_frame(fig, f_idx):
     plt.savefig(out_path, dpi=TARGET_DPI, bbox_inches='tight', pad_inches=0)
     plt.close(fig)
 
-# ------------------------------------------------------------
-# 10. 메인: process_single_frame (리팩토링 버전)
-# ------------------------------------------------------------
+
 def process_single_frame(
     f_idx,
     fname,
@@ -2080,6 +2064,7 @@ def process_single_frame(
 
 
 
+
 def process_all_frames(frame_names, pcd_files, video_segments, obj_id_1, obj_id_2):
     """전체 프레임 루프를 돌면서 측정값 리스트를 생성"""
     last_successful_pose = np.array([0.0, 0.0, 0.0, 0.0])
@@ -2105,7 +2090,7 @@ def save_measurements_csv(measurement_records):
     csv_path = os.path.join(Config.OUTPUT_DIR, "measurements.csv")
 
     with open(csv_path, 'w', newline='') as csvfile:
-        fieldnames = ['frame', 'P1-P2', 'P3-P4', 'P5-P6', 'P7-P8']
+        fieldnames = ['frame', 'P1-P2', 'P3-P4', 'P5-P6', 'P7-P8', 'DZ_mm']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
 
         writer.writeheader()
@@ -2124,7 +2109,8 @@ def save_measurements_csv(measurement_records):
                 'P1-P2': f"{avg_len_top:.6f}",
                 'P3-P4': f"{avg_len_bot:.6f}",
                 'P5-P6': f"{avg_width_top:.6f}",
-                'P7-P8': f"{avg_width_bot:.6f}"
+                'P7-P8': f"{avg_width_bot:.6f}",
+                'DZ_mm': f"{Config.ACWL_DZ}"
             })
 
     print(f"\n📊 Measurements saved to: {csv_path}")
@@ -2133,25 +2119,182 @@ def save_measurements_csv(measurement_records):
         print(f"   Average (excluding first frame) - Length Top: {avg_len_top:.6f}mm, Bottom: {avg_len_bot:.6f}mm")
         print(f"   Average (excluding first frame) - Width Top: {avg_width_top:.6f}mm, Bottom: {avg_width_bot:.6f}mm")
 
+def apply_params_to_config(params):
+    """
+    params: {"name": "a1_b1", "a": 1, "b": 1, "num_runs": 3} 같은 dict
+    """
+    Config.PARAM_W = params["w"]
+    Config.PARAM_H = params["h"]
+    Config.PARAM_TAG = params["name"]
+
+    print(f"[PARAM] W={Config.PARAM_W}, H={Config.PARAM_H}, tag={Config.PARAM_TAG}")
+
+
+def get_next_run_tag(base_root=None):
+    """
+    ./all_runs 아래에 있는 숫자 폴더들을 보고
+    다음 실행 번호를 "001", "002", ... 형식으로 반환.
+    """
+    if base_root is None:
+        base_root = Config.BASE_OUTPUT_ROOT
+
+    os.makedirs(base_root, exist_ok=True)
+
+    existing = []
+    for name in os.listdir(base_root):
+        full = os.path.join(base_root, name)
+        if os.path.isdir(full) and name.isdigit():
+            try:
+                existing.append(int(name))
+            except ValueError:
+                continue
+
+    if not existing:
+        next_idx = 1
+    else:
+        next_idx = max(existing) + 1
+
+    return f"{next_idx:03d}"  # 1 -> "001", 12 -> "012"
+
+def generate_param_sets(w_values, h_values, num_runs=1):
+    """
+    PARAM_W × PARAM_H 조합으로 PARAM_SET 딕셔너리를 자동 생성
+
+    Args:
+        w_values: PARAM_W 값 리스트
+        h_values: PARAM_H 값 리스트
+        num_runs: 각 조합별 반복 횟수
+
+    Returns:
+        PARAM_SETS: 자동 생성된 파라미터 세트 딕셔너리 리스트
+    """
+    param_sets = []
+
+    for w in w_values:
+        for h in h_values:
+            # TAG 생성: '-' 기호 유지
+            tag_w = f"{w}" if w < 0 else f"{w}"
+            tag_h = f"{h}" if h < 0 else f"{h}"
+
+            param_tag = f"W{tag_w}H{tag_h}"  # 예: W-10H-5
+
+            d = {
+                "name": param_tag,
+                "w": w,
+                "h": h,
+                "num_runs": num_runs
+            }
+            param_sets.append(d)
+
+    return param_sets
+
+# 예시: param a, b 두 개
+W_VALUES = [-10, -5, 0, 5, 10]
+H_VALUES = [-10, -5, 0, 5, 10]
+
+PARAM_SETS = generate_param_sets(W_VALUES, H_VALUES, num_runs=5)
+
+# 출력 확인
+for p in PARAM_SETS:
+    print(p)
+
+
+
 
 def main():
     start_time = time.time()
-    # 1) SAM2 초기화 + 프롬프트 + 파일 목록
-    inference_state, frame_names, pcd_files, obj_id_1, obj_id_2 = initialize_sam2_and_prompts()
 
-    # 2) SAM2 전 프레임 propagate
-    video_segments = build_video_segments(inference_state)
+    base_sequences_dir = "/workspace/sequences_sample/20251128"
+    print("\n" + "="*60)
+    print("Starting Parameter Sweep + Multi-Schedule Processing")
+    print("="*60)
+    print(f"Base sequences dir: {base_sequences_dir}")
 
-    # 3) 프레임별 처리 및 측정
-    measurement_records = process_all_frames(
-        frame_names, pcd_files, video_segments, obj_id_1, obj_id_2
-    )
+    # 0. 스케줄 ID 모으기
+    schedule_ids = get_all_schedule_ids(base_sequences_dir)
+    if not schedule_ids:
+        print("\nNo valid schedule IDs found. Exiting.")
+        return
 
-    print("\n✅ Processing Complete.")
-    elapsed_time = time.time() - start_time
-    print(f"   Total time: {elapsed_time:.2f} seconds for {len(frame_names)} frames.")
-    # 4) CSV 저장
-    save_measurements_csv(measurement_records)
+    print(f"\nFound {len(schedule_ids)} schedule(s):")
+    for sid in schedule_ids:
+        print(f"   - {sid}")
+
+    total_success = 0
+    total_fail = 0
+
+    # 1. 파라미터 세트별 루프
+    for p_idx, params in enumerate(PARAM_SETS, 1):
+        print("\n" + "#"*80)
+        print(f"[PARAM SET {p_idx}/{len(PARAM_SETS)}] name={params['name']}, "
+              f"W={params['w']}, H={params['h']}, num_runs={params['num_runs']}")
+        print("#"*80)
+
+        # 파라미터를 Config에 적용
+        apply_params_to_config(params)
+
+        # 2. 반복 실행 루프 (run_tag: "001", "002", ...)
+        for run_idx in range(1, params["num_runs"] + 1):
+            run_tag = f"{run_idx:03d}"
+            print("\n" + "-"*70)
+            print(f"[RUN {run_tag}] for param set '{params['name']}'")
+            print("-"*70)
+
+            # 3. 스케줄별 실행
+            for s_idx, schedule_id in enumerate(schedule_ids, 1):
+                print("\n" + "="*60)
+                print(f"Processing Schedule {s_idx}/{len(schedule_ids)}: {schedule_id}")
+                print("="*60)
+
+                try:
+                    # Config 업데이트 (파라미터 태그 + run_tag 포함)
+                    update_config(
+                        schedule_id,
+                        base_sequences_dir=base_sequences_dir,
+                        run_tag=run_tag,
+                        param_tag=params["name"]
+                    )
+
+                    # SAM2 / 프롬프트 / 파일 목록 준비
+                    (inference_state,
+                     frame_names,
+                     pcd_files,
+                     obj_id_1,
+                     obj_id_2) = initialize_sam2_and_prompts()
+
+                    # 전 프레임 propagate
+                    video_segments = build_video_segments(inference_state)
+
+                    # 프레임별 처리
+                    measurement_records = process_all_frames(
+                        frame_names, pcd_files, video_segments, obj_id_1, obj_id_2
+                    )
+
+                    # CSV 저장 (이 함수 안에서 Config.OUTPUT_DIR 사용하도록 구현되어 있다고 가정)
+                    save_measurements_csv(measurement_records)
+
+                    print(f"\nSchedule {schedule_id} completed successfully "
+                          f"(param={params['name']}, run={run_tag}).")
+                    total_success += 1
+
+                except Exception as e:
+                    print(f"\nError processing schedule {schedule_id} "
+                          f"(param={params['name']}, run={run_tag}): {e}")
+                    traceback.print_exc()
+                    total_fail += 1
+                    # 이 스케줄은 건너뛰고 다음 스케줄로
+                    continue
+
+    elapsed = time.time() - start_time
+    print("\n" + "="*60)
+    print("All Parameter Sets Finished")
+    print("="*60)
+    print(f"   Total Successful: {total_success}")
+    print(f"   Total Failed    : {total_fail}")
+    print(f"   Elapsed         : {elapsed:.2f} s")
+    print("="*60 + "\n")
+
+    
 
 
 if __name__ == "__main__":
