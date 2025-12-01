@@ -6,7 +6,6 @@ SAM2 Video Predictor + Full 3D Visualization
 import os
 import sys
 import csv
-import copy
 import traceback
 import re
 import glob
@@ -69,15 +68,14 @@ predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=device
 # 4. 경로 및 파라미터 설정
 # ========================================
 class Config:
-    # 기본값 설정 (실행 시 update_config로 업데이트됨)
-    ID = None
-    BASE_DIR = None
-    VIDEO_DIR = None
-    PCD_DIR = None
-    RESULTS_DIR = None
+    ID = "202511270905601477"
+    BASE_DIR = f"/workspace/sequences_sample/{ID}"
+    VIDEO_DIR = f"{BASE_DIR}/image"
+    PCD_DIR = f"{BASE_DIR}/pcd"
+    RESULTS_DIR = f"{BASE_DIR}/results"
     INTRINSIC_PATH = "/workspace/sam2/intrinsic.csv"
     EXTRINSIC_PATH = "/workspace/sam2/transform3_tuned_tuned.txt"
-    OUTPUT_DIR = None
+    OUTPUT_DIR = f"./frame_out_full_vis/{ID}/"
     
     REVERSED = True
     
@@ -86,8 +84,13 @@ class Config:
     OBJ_1_LABELS = np.array([1, 1, 0], dtype=np.int32)  # 3 positive prompts
     
     # Obj2 프롬프트 (고정)
-    OBJ_2_POINTS = None
-    OBJ_2_LABELS = None
+    if not REVERSED :
+        OBJ_2_POINTS = np.array([[820, 270], [820, 800]], dtype=np.float32)
+        OBJ_2_LABELS = np.array([1, 1], dtype=np.int32)
+    else :
+        OBJ_2_POINTS = np.array([[830, 490], [830, 670]], dtype=np.float32)
+        OBJ_2_LABELS = np.array([1, 1], dtype=np.int32)
+    
     
     APPLY_EROSION = True
     EROSION_KERNEL_SIZE = 9
@@ -101,61 +104,7 @@ class Config:
     PARAM_W = None
     PARAM_H = None
 
-def update_config(schedule_id, base_sequences_dir="/workspace/sequences_sample"):
-    """
-    주어진 스케줄 ID로 Config를 동적으로 업데이트
-    """
-    Config.ID = schedule_id
-    Config.BASE_DIR = f"{base_sequences_dir}/{schedule_id}"
-    Config.VIDEO_DIR = f"{Config.BASE_DIR}/image"
-    Config.PCD_DIR = f"{Config.BASE_DIR}/pcd"
-    Config.RESULTS_DIR = f"{Config.BASE_DIR}/results"
-    Config.OUTPUT_DIR = f"./all_sequences/{schedule_id}/results"
-    
-    # Obj2 프롬프트 초기화 (ML 모델로 나중에 대체됨)
-    if not Config.REVERSED:
-        Config.OBJ_2_POINTS = np.array([[820, 270], [820, 800]], dtype=np.float32)
-        Config.OBJ_2_LABELS = np.array([1, 1], dtype=np.int32)
-    else:
-        Config.OBJ_2_POINTS = np.array([[830, 490], [830, 670]], dtype=np.float32)
-        Config.OBJ_2_LABELS = np.array([1, 1], dtype=np.int32)
-    
-    os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
-    print(f"\n{'='*60}")
-    print(f"📁 Config updated for Schedule ID: {schedule_id}")
-    print(f"   Video: {Config.VIDEO_DIR}")
-    print(f"   PCD: {Config.PCD_DIR}")
-    print(f"   Results: {Config.RESULTS_DIR}")
-    print(f"   Output: {Config.OUTPUT_DIR}")
-    print(f"{'='*60}\n")
-
-def get_all_schedule_ids(base_dir="/workspace/sequences_sample"):
-    """
-    sequences_sample 디렉토리에서 모든 스케줄 ID를 추출
-    각 스케줄 ID는 image, pcd, results 하위 디렉토리를 가져야 함
-    """
-    if not os.path.exists(base_dir):
-        print(f"⚠️ Base directory not found: {base_dir}")
-        return []
-    
-    schedule_ids = []
-    for item in sorted(os.listdir(base_dir)):
-        item_path = os.path.join(base_dir, item)
-        if not os.path.isdir(item_path):
-            continue
-        
-        # image, pcd, results 디렉토리 존재 여부 확인
-        has_image = os.path.isdir(os.path.join(item_path, "image"))
-        has_pcd = os.path.isdir(os.path.join(item_path, "pcd"))
-        has_results = os.path.isdir(os.path.join(item_path, "results"))
-        
-        if has_image and has_pcd and has_results:
-            schedule_ids.append(item)
-            print(f"   ✅ Found valid schedule: {item}")
-        else:
-            print(f"   ⚠️ Skipping {item} (missing subdirectories)")
-    
-    return schedule_ids
+os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
 
 # ========================================
 # 5. 프롬프트 예측 함수 (ML Model 기반)
@@ -185,7 +134,7 @@ def parse_txt_full(path):
     L = int(L_match.group(1))
     return dz, w, L
 
-def predict_obj2_prompts(schedule_id, results_dir, n_points=N_POINTS_OBJ2):
+def predict_obj2_prompts(schedule_id, n_points=N_POINTS_OBJ2):
     """
     ML 모델을 사용하여 OBJ_2 프롬프트 자동 예측
     
@@ -212,7 +161,8 @@ def predict_obj2_prompts(schedule_id, results_dir, n_points=N_POINTS_OBJ2):
         return None
     
     # Results 디렉토리에서 첫 번째 txt 파일 찾기
-    results_dir = results_dir
+    base_dir = f"/workspace/sequences_sample/{schedule_id}"
+    results_dir = os.path.join(base_dir, "results")
     
     if not os.path.exists(results_dir):
         print(f"   ⚠️ Results 디렉토리 없음: {results_dir}")
@@ -309,6 +259,7 @@ def recommend_wh_from_gp(dz, default_W=10, default_H=10):
     print(f"[GP] dz={dz} -> recommended W={best_W:.1f}, H={best_H:.1f}")
     return best_W, best_H
 
+
 def parse_dz_from_results(results_dir, frame_idx=0):
     """
     Parse DZ Distance value from results text file
@@ -374,7 +325,7 @@ K_camera, D_dist, T_l2c = load_camera_params(Config.INTRINSIC_PATH, Config.EXTRI
 def show_mask(mask, ax, obj_id=None, random_color=False):
     """마스크 시각화"""
     if random_color:
-        color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
+        color = np.concatenate([np.random.random(3), np.array([0.3])], axis=0)
     else:
         cmap = plt.get_cmap("tab10")
         cmap_idx = 0 if obj_id is None else obj_id
@@ -459,6 +410,7 @@ model_points_2d = np.array([
     [MAGNET_WIDTH, 0.0]     # Point 3: TR
 ], dtype=np.float32)
 
+
 model_points_3d_top = np.hstack([model_points_2d, np.zeros((4, 1))])
 
 def affine_matrix(param):
@@ -521,7 +473,6 @@ def order_points_for_model(pts):
     return rect
 
 
-
 def mask_from_minrect(sparse_mask, min_points=10, w_pad=0, h_pad=0):
     """
     Args:
@@ -559,6 +510,88 @@ def mask_from_minrect(sparse_mask, min_points=10, w_pad=0, h_pad=0):
     cv2.fillPoly(solid_mask, [box], 1)
     
     return solid_mask.astype(bool), box
+
+def mask_from_quadrilateral(sparse_mask,
+                            min_points=10,
+                            epsilon_ratio=0.02,
+                            max_iter=10,
+                            dilate_px=3):
+    """
+    sparse_mask에서 True인 점들을 기반으로
+    - convex hull 계산
+    - approxPolyDP로 4변 다각형(사각형)으로 근사
+    하여 마스크 생성.
+
+    Args:
+        sparse_mask: bool 배열 (H, W)
+        min_points: 최소 포인트 개수. 이보다 적으면 빈 마스크 반환
+        epsilon_ratio: arcLength * epsilon_ratio 를 approxPolyDP의 초기 epsilon으로 사용
+        max_iter: epsilon을 조정하며 4점 맞추기 시도하는 최대 반복 횟수
+        dilate_px: 생성된 사각형 마스크를 팽창시킬 픽셀 수 (0이면 팽창 안함)
+
+    Returns:
+        solid_mask: bool (H, W), 4변 다각형 영역만 True
+        quad_pts: (4, 2) int32, 사각형 꼭짓점 (시계/반시계 순서)
+                  4점 근사 실패 시 None
+    """
+    ys, xs = np.where(sparse_mask)
+
+    if len(xs) < min_points:
+        print(f"[WARN] Not enough points for quadrilateral: {len(xs)} < {min_points}")
+        return np.zeros_like(sparse_mask, dtype=bool), None
+
+    H, W = sparse_mask.shape
+
+    # 1. 포인트 모음
+    points = np.column_stack([xs, ys]).astype(np.float32)  # (N,2)
+
+    # 2. Convex Hull
+    hull = cv2.convexHull(points)  # (M,1,2)
+    peri = cv2.arcLength(hull, True)
+
+    # 3. approxPolyDP로 4점 맞추기 시도
+    eps = epsilon_ratio * peri
+    quad = None
+
+    for i in range(max_iter):
+        approx = cv2.approxPolyDP(hull, eps, True)  # (K,1,2)
+        k = len(approx)
+
+        if k == 4:
+            quad = approx.reshape(-1, 2)
+            break
+
+        # 점이 너무 많으면 -> epsilon 키운다 (더 단순화)
+        if k > 4:
+            eps *= 1.5
+        # 점이 너무 적으면 -> epsilon 줄인다 (덜 단순화)
+        elif k < 4:
+            eps *= 0.7
+
+    if quad is None or len(quad) != 4:
+        print(f"[WARN] Failed to approximate 4-point polygon (got {len(approx)} points). "
+              f"Fallback to convex hull fill.")
+        # 실패 시: hull 전체를 마스크로 사용 (또는 여기서 minAreaRect / bbox로 대체 가능)
+        solid_mask = np.zeros((H, W), dtype=np.uint8)
+        cv2.fillPoly(solid_mask, [hull.astype(np.int32)], 1)
+        if dilate_px > 0:
+            ksize = 2 * dilate_px + 1
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+            solid_mask = cv2.dilate(solid_mask, kernel, iterations=1)
+        return solid_mask.astype(bool), None
+
+    # 4. 4점 사각형을 마스크로 채우기
+    solid_mask = np.zeros((H, W), dtype=np.uint8)
+    quad_int = quad.astype(np.int32)
+    cv2.fillPoly(solid_mask, [quad_int], 1)
+
+    # 5. 팽창 옵션
+    if dilate_px > 0:
+        ksize = 2 * dilate_px + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+        solid_mask = cv2.dilate(solid_mask, kernel, iterations=1)
+
+    return solid_mask.astype(bool), quad_int
 
 
 
@@ -600,12 +633,14 @@ def filter_points_by_mask(points_3d_cam, mask, K, D, W, H,
 
     # 2. 이미지 범위 체크
     valid_uv = (u >= 0) & (u < W) & (v >= 0) & (v < H)
-
+    print(f"[INFO] UV valid count: {np.sum(valid_uv)} / {len(points_3d_cam)}")
     # 3. 깊이 범위 체크
     if depth_threshold is not None:
         depth_min = depth_threshold - depth_range
         depth_max = depth_threshold + 0.2
         depth_valid = (points_3d_cam[:, 2] >= depth_min) & (points_3d_cam[:, 2] <= depth_max)
+        print(f"[INFO] Depth filtering: {depth_min:.2f}m ~ {depth_max:.2f}m")
+        print(f"[INFO] Depth valid count: {np.sum(depth_valid)} / {len(points_3d_cam)}")
     else:
         depth_valid = np.ones(len(points_3d_cam), dtype=bool)
 
@@ -653,6 +688,7 @@ def filter_points_by_mask(points_3d_cam, mask, K, D, W, H,
         return filtered_points
 
 
+
 def refine_pose_icp_constrained(source_bottom_points, target_plane_points, max_iteration=30):
     """
     [수정됨] Roll(좌우) + Pitch(앞뒤) 회전 및 Z축 이동 허용.
@@ -674,7 +710,7 @@ def refine_pose_icp_constrained(source_bottom_points, target_plane_points, max_i
     source.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamRadius(radius=search_radius))
     
     # 2. 일반 ICP 수행
-    threshold = 0.2
+    threshold = 0.3
     T_init = np.identity(4)
     
     reg = o3d.pipelines.registration.registration_icp(
@@ -1012,7 +1048,6 @@ def calculate_length_measurements(magnet_pose, slab_corners_3d):
     # 위쪽 측정점 (P1): X=0.45, Y = 0.7 (700mm)
     # 아래쪽 측정점 (P2): X=0.45, Y = 2.25 - 0.7 (1.55m)
     # 측정 방향 (Normal): X축 양의 방향 (1, 0, 0) -> 그림상 오른쪽 화살표
-    
     local_p1 = np.array([MAGNET_WIDTH, 0.7, 0.0])
     local_p2 = np.array([MAGNET_WIDTH, MAGNET_LENGTH - 0.7, 0.0])
     
@@ -1290,8 +1325,7 @@ def initialize_sam2_and_prompts():
 
     # Obj2 프롬프트 (ML)
     print(f"\n   🤖 Predicting OBJ_2 prompts using ML model...")
-    obj2_predicted = predict_obj2_prompts(Config.ID, Config.RESULTS_DIR, n_points=N_POINTS_OBJ2)
-
+    obj2_predicted = predict_obj2_prompts(Config.ID, n_points=N_POINTS_OBJ2)
 
     if obj2_predicted is not None:
         print(f"   ✅ ML prediction successful ({len(obj2_predicted)} points):")
@@ -1766,11 +1800,17 @@ def prepare_obj2_points_and_rbox(
     if not (pcd_path and os.path.exists(pcd_path) and mask_obj2 is not None):
         return obj2_pts_cam, mask_obj2, obj2_rbox_corners
 
-    # LiDAR PCD → Camera
+    # LiDAR PCD → x > 0 필터링
     pcd = o3d.io.read_point_cloud(pcd_path)
     pts_l = np.asarray(pcd.points, dtype=np.float32)
-    pts_h = np.hstack([pts_l, np.ones((len(pts_l), 1), dtype=np.float32)])
-
+    
+    # x > 0 필터링 (LiDAR 좌표계)
+    mask_x_positive = pts_l[:, 0] > 0
+    pts_l_filtered = pts_l[mask_x_positive]
+    print(f"   🔍 LiDAR x>0 filter: {len(pts_l_filtered)}/{len(pts_l)} points")
+    
+    # Camera로 변환
+    pts_h = np.hstack([pts_l_filtered, np.ones((len(pts_l_filtered), 1), dtype=np.float32)])
     P_full_cam = (T_l2c @ pts_h.T).T[:, :3]
 
     # 마스크 + 깊이 필터링
@@ -1978,7 +2018,9 @@ def save_output_frame(fig, f_idx):
     plt.savefig(out_path, dpi=TARGET_DPI, bbox_inches='tight', pad_inches=0)
     plt.close(fig)
 
-
+# ------------------------------------------------------------
+# 10. 메인: process_single_frame (리팩토링 버전)
+# ------------------------------------------------------------
 def process_single_frame(
     f_idx,
     fname,
@@ -1986,19 +2028,28 @@ def process_single_frame(
     video_segments,
     obj_id_1,
     obj_id_2,
-    last_successful_pose
+    last_successful_pose,
+    timings=None
 ):
+    frame_start = time.time()
+    
     # 0) 프레임/figure 준비
+    t0 = time.time()
     img, fig, ax, W, H, img_path = load_and_prepare_frame(f_idx, fname)
+    if timings is not None:
+        timings['load_image'] = timings.get('load_image', 0) + (time.time() - t0)
 
     # PCD 경로
     pcd_path = os.path.join(Config.PCD_DIR, pcd_files[f_idx]) if f_idx < len(pcd_files) else None
 
     # 마스크/박스
+    t0 = time.time()
     masks = video_segments.get(f_idx, {})
     mask_obj1, mask_obj2, obj1_corners, obj2_rbox_corners = extract_masks_and_rboxes(
         ax, masks, obj_id_1, obj_id_2, H, W
     )
+    if timings is not None:
+        timings['extract_masks'] = timings.get('extract_masks', 0) + (time.time() - t0)
 
     estimated_param = None
     final_box_mesh = None
@@ -2013,20 +2064,29 @@ def process_single_frame(
     try:
         # 1) Obj1 pose
         if obj1_corners is not None:
+            t0 = time.time()
             estimated_param, last_successful_pose = estimate_pose_obj1(
                 obj1_corners, last_successful_pose
             )
+            if timings is not None:
+                timings['pose_estimation'] = timings.get('pose_estimation', 0) + (time.time() - t0)
 
             # 2) Obj2 포인트 + rbox
+            t0 = time.time()
             obj2_pts_cam, mask_obj2, obj2_rbox_corners = prepare_obj2_points_and_rbox(
                 pcd_path, mask_obj2, obj_id_2, ax, H, W
             )
+            if timings is not None:
+                timings['obj2_filtering'] = timings.get('obj2_filtering', 0) + (time.time() - t0)
 
             # 3) 평면+ICP+박스
+            t0 = time.time()
             normal_obj2, centroid_obj2, synthetic_plane_cloud, \
                 T_icp_final, final_box_mesh, final_wireframe = fit_plane_and_icp_for_obj2(
                     obj2_pts_cam, obj2_rbox_corners, estimated_param
                 )
+            if timings is not None:
+                timings['plane_icp'] = timings.get('plane_icp', 0) + (time.time() - t0)
 
             if synthetic_plane_cloud is not None:
                 final_icp_points = synthetic_plane_cloud
@@ -2038,6 +2098,7 @@ def process_single_frame(
 
             # 5) 측정 + 2D draw
             if slab_corners_3d is not None and final_box_mesh is not None:
+                t0 = time.time()
                 measurement_record = compute_and_draw_measurements(
                     ax,
                     f_idx,
@@ -2048,8 +2109,11 @@ def process_single_frame(
                     T_icp_final,
                     estimated_param
                 )
+                if timings is not None:
+                    timings['measurements'] = timings.get('measurements', 0) + (time.time() - t0)
 
         # 6) obj2_pts_cam 포인트 투영 그리기
+        t0 = time.time()
         if obj2_pts_cam is not None:
             draw_projected_obj2_points(ax, obj2_pts_cam, W, H)
 
@@ -2058,13 +2122,20 @@ def process_single_frame(
 
         # 8) Pose/측정 텍스트
         draw_pose_and_measurements(ax, estimated_param, measurement_record)
+        
+        if timings is not None:
+            timings['visualization'] = timings.get('visualization', 0) + (time.time() - t0)
 
     except Exception as e:
         print(f"❌ Error frame {f_idx}: {e}")
         traceback.print_exc()
 
     # 9) 이미지 저장
+    t0 = time.time()
     save_output_frame(fig, f_idx)
+    if timings is not None:
+        timings['save_image'] = timings.get('save_image', 0) + (time.time() - t0)
+        timings['total_per_frame'] = timings.get('total_per_frame', 0) + (time.time() - frame_start)
 
     # 10) Open3D 시각화 (원래 로직 유지)
     if Config.SHOW_O3D and pcd_path and os.path.exists(pcd_path):
@@ -2086,21 +2157,21 @@ def process_single_frame(
 
 
 
-
 def process_all_frames(frame_names, pcd_files, video_segments, obj_id_1, obj_id_2):
     """전체 프레임 루프를 돌면서 측정값 리스트를 생성"""
     last_successful_pose = np.array([0.0, 0.0, 0.0, 0.0])
     measurement_records = []
+    timings = {}
 
     for f_idx, fname in enumerate(frame_names):
         last_successful_pose, record = process_single_frame(
             f_idx, fname, pcd_files, video_segments,
-            obj_id_1, obj_id_2, last_successful_pose
+            obj_id_1, obj_id_2, last_successful_pose, timings
         )
         if record is not None:
             measurement_records.append(record)
 
-    return measurement_records
+    return measurement_records, timings
 
 
 def save_measurements_csv(measurement_records):
@@ -2108,6 +2179,42 @@ def save_measurements_csv(measurement_records):
     if len(measurement_records) == 0:
         print("\n⚠️ No measurements recorded.")
         return
+
+    csv_path = os.path.join(Config.OUTPUT_DIR, "measurements.csv")
+
+    with open(csv_path, 'w', newline='') as csvfile:
+        fieldnames = ['frame', 'P1-P2', 'P3-P4', 'P5-P6', 'P7-P8']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+
+        writer.writeheader()
+        for record in measurement_records:
+            writer.writerow(record)
+
+        # 첫 프레임(보통 warm-up 성격)을 제외하고 평균 계산
+        if len(measurement_records) > 1:
+            records_for_avg = measurement_records[1:]
+            avg_len_top = np.mean([r['P1-P2'] for r in records_for_avg])
+            avg_len_bot = np.mean([r['P3-P4'] for r in records_for_avg])
+            avg_width_top = np.mean([r['P5-P6'] for r in records_for_avg])
+            avg_width_bot = np.mean([r['P7-P8'] for r in records_for_avg])
+
+            writer.writerow({
+                'frame': 'AVERAGE',
+                'P1-P2': f"{avg_len_top:.6f}",
+                'P3-P4': f"{avg_len_bot:.6f}",
+                'P5-P6': f"{avg_width_top:.6f}",
+                'P7-P8': f"{avg_width_bot:.6f}"
+            })
+
+    print(f"\n📊 Measurements saved to: {csv_path}")
+    print(f"   Total frames with measurements: {len(measurement_records)}")
+    if len(measurement_records) > 1:
+        print(f"   Frames used for average (excluding first): {len(measurement_records) - 1}")
+        print(f"   Avg P1-P2 (Top Length)   : {avg_len_top:.2f} mm")
+        print(f"   Avg P3-P4 (Bottom Length): {avg_len_bot:.2f} mm")
+        print(f"   Avg P5-P6 (Top Width)    : {avg_width_top:.2f} mm")
+        print(f"   Avg P7-P8 (Bottom Width) : {avg_width_bot:.2f} mm")
+
 
     csv_path = os.path.join(Config.OUTPUT_DIR, "measurements.csv")
 
@@ -2140,77 +2247,129 @@ def save_measurements_csv(measurement_records):
         print(f"   Average (excluding first frame) - Length Top: {avg_len_top:.6f}mm, Bottom: {avg_len_bot:.6f}mm")
         print(f"   Average (excluding first frame) - Width Top: {avg_width_top:.6f}mm, Bottom: {avg_width_bot:.6f}mm")
 
+def print_timings(timings, n_frames):
+    """각 단계별 총 소요 시간 및 프레임당 평균 시간 출력"""
+    if not timings:
+        print("\n⏱ No timing info collected.")
+        return
+
+    print("\n================ Timing Summary ================")
+    total_per_frame_sum = timings.get('total_per_frame', 0.0)
+
+    for key, val in timings.items():
+        if key == 'total_per_frame':
+            continue
+        avg = val / max(n_frames, 1)
+        print(f"{key:20s}: {val:8.3f} s  (avg {avg:7.4f} s/frame)")
+
+    if total_per_frame_sum > 0:
+        avg_total = total_per_frame_sum / max(n_frames, 1)
+        print("------------------------------------------------")
+        print(f"{'total_per_frame':20s}: {total_per_frame_sum:8.3f} s  "
+              f"(avg {avg_total:7.4f} s/frame)")
+    print("===============================================")
+
 
 def main():
-    start_time = time.time()
-    """
-    전체 스케줄 ID를 순회하며 각각에 대해 SAM2 추론 수행
-    """
+    total_start = time.time()
+    
+    # 1) SAM2 초기화 + 프롬프트 + 파일 목록
     print("\n" + "="*60)
-    print("🚀 Starting Multi-Schedule Processing")
+    print("🚀 Starting Processing")
     print("="*60)
     
-    # 1. 모든 스케줄 ID 가져오기
-    base_sequences_dir = "/workspace/sequences_sample/20251128"
-    print(f"\n📂 Scanning directory: {base_sequences_dir}")
-    schedule_ids = get_all_schedule_ids(base_sequences_dir)
+    t_init = time.time()
+    inference_state, frame_names, pcd_files, obj_id_1, obj_id_2 = initialize_sam2_and_prompts()
+    time_init = time.time() - t_init
+
+    # 2) SAM2 전 프레임 propagate
+    t_prop = time.time()
+    video_segments = build_video_segments(inference_state)
+    time_propagate = time.time() - t_prop
+
+    # 3) 프레임별 처리 및 측정
+    t_proc = time.time()
+    measurement_records, timings = process_all_frames(
+        frame_names, pcd_files, video_segments, obj_id_1, obj_id_2
+    )
+    time_processing = time.time() - t_proc
+
+    # 4) CSV 저장
+    t_csv = time.time()
+    save_measurements_csv(measurement_records)
+    time_csv = time.time() - t_csv
     
-    if not schedule_ids:
-        print("\n❌ No valid schedule IDs found. Exiting.")
-        return
+    total_time = time.time() - total_start
     
-    print(f"\n✅ Found {len(schedule_ids)} valid schedule(s):")
-    for sid in schedule_ids:
-        print(f"   - {sid}")
+    # 타이밍 요약 출력
+    print("\n" + "="*60)
+    print("⏱️  Performance Summary")
+    print("="*60)
+    print(f"\n📊 Overall Timing:")
+    print(f"   1. Initialization:       {time_init:7.2f}s ({time_init/total_time*100:5.1f}%)")
+    print(f"   2. SAM2 Propagation:     {time_propagate:7.2f}s ({time_propagate/total_time*100:5.1f}%)")
+    print(f"   3. Frame Processing:     {time_processing:7.2f}s ({time_processing/total_time*100:5.1f}%)")
+    print(f"   4. CSV Export:           {time_csv:7.2f}s ({time_csv/total_time*100:5.1f}%)")
+    print(f"   {'─'*50}")
+    print(f"   Total Time:              {total_time:7.2f}s")
     
-    # 2. 각 스케줄 ID에 대해 처리
-    success_count = 0
-    fail_count = 0
-    
-    for idx, schedule_id in enumerate(schedule_ids, 1):
-        print("\n" + "="*60)
-        print(f"🔄 Processing Schedule {idx}/{len(schedule_ids)}: {schedule_id}")
-        print("="*60)
+    if len(frame_names) > 0:
+        print(f"\n📈 Per-Frame Statistics ({len(frame_names)} frames):")
+        avg_per_frame = timings.get('total_per_frame', 0) / len(frame_names)
+        print(f"   Average per frame:       {avg_per_frame:7.3f}s")
+        print(f"   FPS (frames/sec):        {1.0/avg_per_frame:7.2f}")
         
-        try:
-            # Config 업데이트
-            update_config(schedule_id, base_sequences_dir)
-            
-            # SAM2 초기화 + 프롬프트 + 파일 목록
-            inference_state, frame_names, pcd_files, obj_id_1, obj_id_2 = initialize_sam2_and_prompts()
-            
-            # SAM2 전 프레임 propagate
-            video_segments = build_video_segments(inference_state)
-            
-            # 프레임별 처리 및 측정
-            measurement_records = process_all_frames(
-                frame_names, pcd_files, video_segments, obj_id_1, obj_id_2
-            )
-            
-            # CSV 저장
-            save_measurements_csv(measurement_records)
-            
-            print(f"\n✅ Schedule {schedule_id} completed successfully.")
-            success_count += 1
-            
-        except Exception as e:
-            print(f"\n❌ Error processing schedule {schedule_id}:")
-            print(f"   {e}")
-            traceback.print_exc()
-            fail_count += 1
-            continue
-    end_time = time.time()
-    elapsed_time = end_time - start_time
-    # 3. 최종 요약
-    print("\n" + "="*60)
-    print("🏁 Multi-Schedule Processing Complete")
-    print("="*60)
-    print(f"   ✅ Successful: {success_count}/{len(schedule_ids)}")
-    print(f"   ❌ Failed: {fail_count}/{len(schedule_ids)}")
-    print(f"\n⏱️ Total processing time: {elapsed_time:.2f} seconds")
-    print("="*60 + "\n")
+        print(f"\n🔍 Detailed Breakdown (average per frame):")
+        breakdown = [
+            ('Load Image', 'load_image'),
+            ('Extract Masks', 'extract_masks'),
+            ('Pose Estimation', 'pose_estimation'),
+            ('Obj2 Filtering', 'obj2_filtering'),
+            ('Plane+ICP', 'plane_icp'),
+            ('Measurements', 'measurements'),
+            ('Visualization', 'visualization'),
+            ('Save Image', 'save_image'),
+        ]
+        
+        for label, key in breakdown:
+            if key in timings:
+                avg_time = timings[key] / len(frame_names)
+                pct = (timings[key] / timings['total_per_frame']) * 100
+                print(f"   {label:.<20} {avg_time:7.3f}s ({pct:5.1f}%)")
     
+    print("\n" + "="*60)
+    print("✅ Processing Complete")
+    print("="*60 + "\n")
 
 
 if __name__ == "__main__":
-    main()
+    # 1) SAM2 초기화 + 프롬프트 생성 + 프레임/PCD 리스트 준비
+    inference_state, frame_names, pcd_files, obj_id_1, obj_id_2 = initialize_sam2_and_prompts()
+
+    if len(frame_names) == 0:
+        print("❌ No image frames found in:", Config.VIDEO_DIR)
+        sys.exit(1)
+    if len(pcd_files) == 0:
+        print("⚠️ No PCD files found in:", Config.PCD_DIR)
+
+    # 2) SAM2로 전체 비디오에 대해 마스크 전파
+    print("\n==============================================")
+    print("Building video_segments (SAM2 propagate_in_video)...")
+    print("==============================================")
+    video_segments = build_video_segments(inference_state)
+
+    # 3) 모든 프레임 처리 + 측정값 계산
+    print("\n==============================================")
+    print("Processing all frames (pose + LiDAR + measurement)...")
+    print("==============================================")
+    measurement_records, timings = process_all_frames(
+        frame_names, pcd_files, video_segments, obj_id_1, obj_id_2
+    )
+
+    # 4) 결과 CSV 저장
+    save_measurements_csv(measurement_records)
+
+    # 5) 타이밍 요약 출력
+    print_timings(timings, n_frames=len(frame_names))
+
+    print("\n✅ All done.")
