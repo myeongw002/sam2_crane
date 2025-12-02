@@ -322,18 +322,14 @@ K_camera, D_dist, T_l2c = load_camera_params(Config.INTRINSIC_PATH, Config.EXTRI
 # 6. 유틸리티 함수 (마스크 처리)
 # ========================================
 # ... (show_mask, apply_erosion, to_bool_mask, clamp_inside 함수는 그대로 유지) ...
-def show_mask(mask, ax, obj_id=None, random_color=False):
-    """마스크 시각화"""
-    if random_color:
-        color = np.concatenate([np.random.random(3), np.array([0.3])], axis=0)
-    else:
-        cmap = plt.get_cmap("tab10")
-        cmap_idx = 0 if obj_id is None else obj_id
-        color = np.array([*cmap(cmap_idx)[:3], 0.6])
-    
-    h, w = mask.shape[-2:]
-    mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
-    ax.imshow(mask_image)
+def show_mask_cv(base_img_bgr, mask_bool, color_bgr=(0, 255, 0), alpha=0.4):
+    # base_img_bgr: (H,W,3) uint8, BGR
+    overlay = base_img_bgr.copy()
+    overlay[mask_bool] = color_bgr
+    # 알파 블렌딩
+    out = cv2.addWeighted(overlay, alpha, base_img_bgr, 1 - alpha, 0)
+    base_img_bgr[:] = out
+
 
 def apply_erosion(mask_bool, kernel_size=5, iterations=1):
     """마스크에 erosion 적용하여 경계를 축소"""
@@ -375,20 +371,34 @@ def mask_to_rotated_box(mask_bool):
     
     return corners, angle_deg, (xmin, ymin, xmax, ymax), top_cx, top_y, bottom_cx, bottom_y, left_x, left_y, right_x, right_y
 
-def draw_mask_and_rbox(ax, mask_bool, oid, edge_color, H, W, apply_erosion_flag=True, erosion_kernel=5, erosion_iter=1):
-    """마스크와 회전 박스 그리기 및 좌표 반환"""
-    show_mask(mask_bool, ax, obj_id=oid)
-    
-    mask_for_box = apply_erosion(mask_bool, kernel_size=erosion_kernel, iterations=erosion_iter) if apply_erosion_flag else mask_bool
-    
-    corners, angle_deg, aabb, top_cx, top_y, bottom_cx, bottom_y, left_x, left_y, right_x, right_y = mask_to_rotated_box(mask_for_box)
-    
-    if corners is None:
-        return None, None, None, None, None, None, None, None
-    
-    poly = Polygon(corners, closed=True, fill=False, linewidth=2, edgecolor=edge_color)
-    ax.add_patch(poly)
-    
+def draw_mask_and_rbox(img_bgr, mask_bool, oid, edge_color,
+                       apply_erosion_flag=True, erosion_kernel=5, erosion_iter=1):
+
+    # mask 색칠 (알파 블렌딩)
+    if oid == 1 :
+        mask_color = (0,127,255)
+    else :
+        mask_color = (0,255,0)
+    show_mask_cv(img_bgr, mask_bool, color_bgr=mask_color, alpha=0.3)
+
+    # erosion 적용
+    if apply_erosion_flag:
+        mask_for_box = apply_erosion(mask_bool, kernel_size=erosion_kernel, iterations=erosion_iter)
+    else:
+        mask_for_box = mask_bool
+
+    # 회전박스 추출
+    (
+        corners, angle_deg, aabb,
+        top_cx, top_y, bottom_cx, bottom_y,
+        left_x, left_y, right_x, right_y
+    ) = mask_to_rotated_box(mask_for_box)
+
+    # 회전박스 OpenCV로 그리기
+    if corners is not None:
+        pts = corners.astype(int).reshape(-1, 1, 2)
+        cv2.polylines(img_bgr, [pts], isClosed=True, color=edge_color, thickness=2)
+
     return top_y, top_cx, bottom_y, bottom_cx, left_y, left_x, right_y, right_x
 
 
@@ -510,89 +520,6 @@ def mask_from_minrect(sparse_mask, min_points=10, w_pad=0, h_pad=0):
     cv2.fillPoly(solid_mask, [box], 1)
     
     return solid_mask.astype(bool), box
-
-def mask_from_quadrilateral(sparse_mask,
-                            min_points=10,
-                            epsilon_ratio=0.02,
-                            max_iter=10,
-                            dilate_px=3):
-    """
-    sparse_mask에서 True인 점들을 기반으로
-    - convex hull 계산
-    - approxPolyDP로 4변 다각형(사각형)으로 근사
-    하여 마스크 생성.
-
-    Args:
-        sparse_mask: bool 배열 (H, W)
-        min_points: 최소 포인트 개수. 이보다 적으면 빈 마스크 반환
-        epsilon_ratio: arcLength * epsilon_ratio 를 approxPolyDP의 초기 epsilon으로 사용
-        max_iter: epsilon을 조정하며 4점 맞추기 시도하는 최대 반복 횟수
-        dilate_px: 생성된 사각형 마스크를 팽창시킬 픽셀 수 (0이면 팽창 안함)
-
-    Returns:
-        solid_mask: bool (H, W), 4변 다각형 영역만 True
-        quad_pts: (4, 2) int32, 사각형 꼭짓점 (시계/반시계 순서)
-                  4점 근사 실패 시 None
-    """
-    ys, xs = np.where(sparse_mask)
-
-    if len(xs) < min_points:
-        print(f"[WARN] Not enough points for quadrilateral: {len(xs)} < {min_points}")
-        return np.zeros_like(sparse_mask, dtype=bool), None
-
-    H, W = sparse_mask.shape
-
-    # 1. 포인트 모음
-    points = np.column_stack([xs, ys]).astype(np.float32)  # (N,2)
-
-    # 2. Convex Hull
-    hull = cv2.convexHull(points)  # (M,1,2)
-    peri = cv2.arcLength(hull, True)
-
-    # 3. approxPolyDP로 4점 맞추기 시도
-    eps = epsilon_ratio * peri
-    quad = None
-
-    for i in range(max_iter):
-        approx = cv2.approxPolyDP(hull, eps, True)  # (K,1,2)
-        k = len(approx)
-
-        if k == 4:
-            quad = approx.reshape(-1, 2)
-            break
-
-        # 점이 너무 많으면 -> epsilon 키운다 (더 단순화)
-        if k > 4:
-            eps *= 1.5
-        # 점이 너무 적으면 -> epsilon 줄인다 (덜 단순화)
-        elif k < 4:
-            eps *= 0.7
-
-    if quad is None or len(quad) != 4:
-        print(f"[WARN] Failed to approximate 4-point polygon (got {len(approx)} points). "
-              f"Fallback to convex hull fill.")
-        # 실패 시: hull 전체를 마스크로 사용 (또는 여기서 minAreaRect / bbox로 대체 가능)
-        solid_mask = np.zeros((H, W), dtype=np.uint8)
-        cv2.fillPoly(solid_mask, [hull.astype(np.int32)], 1)
-        if dilate_px > 0:
-            ksize = 2 * dilate_px + 1
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
-            solid_mask = cv2.dilate(solid_mask, kernel, iterations=1)
-        return solid_mask.astype(bool), None
-
-    # 4. 4점 사각형을 마스크로 채우기
-    solid_mask = np.zeros((H, W), dtype=np.uint8)
-    quad_int = quad.astype(np.int32)
-    cv2.fillPoly(solid_mask, [quad_int], 1)
-
-    # 5. 팽창 옵션
-    if dilate_px > 0:
-        ksize = 2 * dilate_px + 1
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
-        solid_mask = cv2.dilate(solid_mask, kernel, iterations=1)
-
-    return solid_mask.astype(bool), quad_int
-
 
 
 def filter_points_by_mask(points_3d_cam, mask, K, D, W, H,
@@ -1497,7 +1424,7 @@ def project_point_to_plane(P, n, p0):
     return P - d * n
 
 def compute_and_draw_measurements(
-    ax,
+    img_bgr,
     f_idx,
     final_vertices,
     slab_corners_3d,
@@ -1509,7 +1436,7 @@ def compute_and_draw_measurements(
     """
     - 마그넷 박스(final_vertices)와 철판 코너(slab_corners_3d)를 이용해
       P1-P2, P3-P4, P5-P6, P7-P8 거리를 계산하고
-      이미지를 기준으로 화살표 및 텍스트를 그린다.
+      이미지(img_bgr)에 화살표 및 텍스트를 그린다.
     - 길이·너비 모두 3D 직선 → 평면 사영 → 엣지 교점 → 3D 거리 방식으로 계산.
     """
     print(f"\n========== compute_and_draw_measurements (frame {f_idx:03d}) ==========")
@@ -1528,7 +1455,6 @@ def compute_and_draw_measurements(
     bottom_right_corner= final_vertices[2]
     top_right_corner   = final_vertices[3]
 
-
     # 마그넷 길이 방향 param (0~MAGNET_LENGTH)
     t1 = 0.7 / MAGNET_LENGTH
     t2 = (MAGNET_LENGTH - 0.7) / MAGNET_LENGTH
@@ -1546,9 +1472,6 @@ def compute_and_draw_measurements(
 
     # ---------------------------
     # 1) 길이 측정 (Top / Bottom)
-    #    - 각 측정점에서 길이 방향 직선을 잡고
-    #    - 직선을 평면에 사영 후, slab 엣지와 교점
-    #    - 원래 측정점 ↔ 교점 3D 거리
     # ---------------------------
     end_pt_top_3d = measure_pt_top1
     end_pt_bot_3d = measure_pt_bot1
@@ -1557,13 +1480,13 @@ def compute_and_draw_measurements(
 
     # 마그넷 축 방향 벡터 (순수 3D)
     len_top_vec   = measure_pt_top1 - measure_pt_top2       # 길이 방향
-    width_top_vec = top_left_corner   - bottom_left_corner       # 너비 방향
+    width_top_vec = top_left_corner   - bottom_left_corner  # 너비 방향
     len_bot_vec   = measure_pt_bot1 - measure_pt_bot2       # 길이 방향
-    width_bot_vec = top_right_corner   - bottom_right_corner       # 너비 방향
+    width_bot_vec = top_right_corner - bottom_right_corner  # 너비 방향
 
-    len_top_dir = len_top_vec / (np.linalg.norm(len_top_vec) + 1e-12)
+    len_top_dir   = len_top_vec   / (np.linalg.norm(len_top_vec)   + 1e-12)
     width_top_dir = width_top_vec / (np.linalg.norm(width_top_vec) + 1e-12)
-    len_bot_dir = len_bot_vec / (np.linalg.norm(len_bot_vec) + 1e-12)
+    len_bot_dir   = len_bot_vec   / (np.linalg.norm(len_bot_vec)   + 1e-12)
     width_bot_dir = width_bot_vec / (np.linalg.norm(width_bot_vec) + 1e-12)
 
     # Top 길이
@@ -1571,8 +1494,8 @@ def compute_and_draw_measurements(
         measure_pt_top1, len_top_dir, slab_corners_3d, n, p0
     )
     if P_int_top is not None:
-        proj_top1 = project_point_to_plane(measure_pt_top1, n, p0)
-        len_top_mm = np.linalg.norm(P_int_top - proj_top1) * 1000.0
+        proj_top1   = project_point_to_plane(measure_pt_top1, n, p0)
+        len_top_mm  = np.linalg.norm(P_int_top - proj_top1) * 1000.0
         end_pt_top_3d = P_int_top
     print(f"[DEBUG] Length Top (mm) = {len_top_mm:.3f}")
 
@@ -1581,19 +1504,17 @@ def compute_and_draw_measurements(
         measure_pt_bot1, len_bot_dir, slab_corners_3d, n, p0
     )
     if P_int_bot is not None:
-        proj_bot1 = project_point_to_plane(measure_pt_bot1, n, p0)
-        len_bot_mm = np.linalg.norm(P_int_bot - proj_bot1) * 1000.0
+        proj_bot1    = project_point_to_plane(measure_pt_bot1, n, p0)
+        len_bot_mm   = np.linalg.norm(P_int_bot - proj_bot1) * 1000.0
         end_pt_bot_3d = P_int_bot
     print(f"[DEBUG] Length Bottom (mm) = {len_bot_mm:.3f}")
 
     # ---------------------------
     # 2) 너비 측정 (Top / Bottom)
-    #    - Top: top_left에서 width_dir 방향
-    #    - Bottom: bottom_left에서 width_dir 방향
     # ---------------------------
-    end_pt_width_top_3d = top_left_corner
+    end_pt_width_top_3d    = top_left_corner
     end_pt_width_bottom_3d = bottom_left_corner
-    width_top_mm = 0.0
+    width_top_mm    = 0.0
     width_bottom_mm = 0.0
 
     # Width Top
@@ -1601,8 +1522,8 @@ def compute_and_draw_measurements(
         top_left_corner, width_top_dir, slab_corners_3d, n, p0
     )
     if P_int_wtop is not None:
-        proj_wtop = project_point_to_plane(top_left_corner, n, p0)
-        width_top_mm = np.linalg.norm(P_int_wtop - proj_wtop) * 1000.0
+        proj_wtop     = project_point_to_plane(top_left_corner, n, p0)
+        width_top_mm  = np.linalg.norm(P_int_wtop - proj_wtop) * 1000.0
         end_pt_width_top_3d = P_int_wtop
     print(f"[DEBUG] Width Top (mm) = {width_top_mm:.3f}")
 
@@ -1611,8 +1532,8 @@ def compute_and_draw_measurements(
         bottom_left_corner, width_bot_dir, slab_corners_3d, n, p0
     )
     if P_int_wbot is not None:
-        proj_wbot = project_point_to_plane(bottom_left_corner, n, p0)
-        width_bottom_mm = np.linalg.norm(P_int_wbot - proj_wbot) * 1000.0
+        proj_wbot        = project_point_to_plane(bottom_left_corner, n, p0)
+        width_bottom_mm  = np.linalg.norm(P_int_wbot - proj_wbot) * 1000.0
         end_pt_width_bottom_3d = P_int_wbot
     print(f"[DEBUG] Width Bottom (mm) = {width_bottom_mm:.3f}")
 
@@ -1646,56 +1567,119 @@ def compute_and_draw_measurements(
     p_end_width_bottom = img_measure_pts[7]
 
     # ---------------------------
-    # 4) 2D 화살표 및 텍스트 그리기
+    # 4) OpenCV로 2D 화살표 및 텍스트 그리기
     # ---------------------------
 
-    # 길이 위쪽 (노란색)
-    ax.plot(p_start_top[0], p_start_top[1], 'o', color='yellow', markersize=6, markeredgecolor='black')
-    ax.plot(p_end_top[0],   p_end_top[1],   'x', color='yellow', markersize=6, markeredgecolor='black')
-    ax.annotate('', xy=p_end_top, xytext=p_start_top,
-                arrowprops=dict(arrowstyle='->', color='yellow', lw=2, shrinkA=0, shrinkB=0))
-    mid_top = (p_start_top + p_end_top) / 2
-    ax.text(
-        mid_top[0], mid_top[1] - 15, f'{len_top_mm:.0f}mm',
-        color='yellow', fontsize=9, weight='bold', ha='center',
-        bbox=dict(boxstyle='round,pad=0.2', facecolor='black', alpha=0.6)
-    )
+    def to_int_tuple(p):
+        return (int(p[0]), int(p[1]))
 
-    # 길이 아래쪽 (시안색)
-    ax.plot(p_start_bot[0], p_start_bot[1], 'o', color='cyan', markersize=6, markeredgecolor='black')
-    ax.plot(p_end_bot[0],   p_end_bot[1],   'x', color='cyan', markersize=6, markeredgecolor='black')
-    ax.annotate('', xy=p_end_bot, xytext=p_start_bot,
-                arrowprops=dict(arrowstyle='->', color='cyan', lw=2, shrinkA=0, shrinkB=0))
-    mid_bot = (p_start_bot + p_end_bot) / 2
-    ax.text(
-        mid_bot[0], mid_bot[1] + 20, f'{len_bot_mm:.0f}mm',
-        color='cyan', fontsize=9, weight='bold', ha='center',
-        bbox=dict(boxstyle='round,pad=0.2', facecolor='black', alpha=0.6)
-    )
+    def draw_cross(img, center, color, size=6, thickness=2):
+        cx, cy = int(center[0]), int(center[1])
+        cv2.line(img, (cx - size, cy - size), (cx + size, cy + size), color, thickness)
+        cv2.line(img, (cx - size, cy + size), (cx + size, cy - size), color, thickness)
 
-    # 너비 위쪽 (마젠타)
-    ax.plot(p_start_width[0], p_start_width[1], 'o', color='magenta', markersize=6, markeredgecolor='black')
-    ax.plot(p_end_width[0],   p_end_width[1],   'x', color='magenta', markersize=6, markeredgecolor='black')
-    ax.annotate('', xy=p_end_width, xytext=p_start_width,
-                arrowprops=dict(arrowstyle='->', color='magenta', lw=2, shrinkA=0, shrinkB=0))
-    mid_width = (p_start_width + p_end_width) / 2
-    ax.text(
-        mid_width[0] - 40, mid_width[1], f'{width_top_mm:.0f}mm',
-        color='magenta', fontsize=9, weight='bold', ha='right',
-        bbox=dict(boxstyle='round,pad=0.2', facecolor='black', alpha=0.6)
-    )
+    h, w = img_bgr.shape[:2]  # 필요시 사용 가능
 
-    # 너비 아래쪽 (라임)
-    ax.plot(p_start_width_bottom[0], p_start_width_bottom[1], 'o', color='lime', markersize=6, markeredgecolor='black')
-    ax.plot(p_end_width_bottom[0],   p_end_width_bottom[1],   'x', color='lime', markersize=6, markeredgecolor='black')
-    ax.annotate('', xy=p_end_width_bottom, xytext=p_start_width_bottom,
-                arrowprops=dict(arrowstyle='->', color='lime', lw=2, shrinkA=0, shrinkB=0))
-    mid_width_bottom = (p_start_width_bottom + p_end_width_bottom) / 2
-    ax.text(
-        mid_width_bottom[0] - 40, mid_width_bottom[1], f'{width_bottom_mm:.0f}mm',
-        color='lime', fontsize=9, weight='bold', ha='right',
-        bbox=dict(boxstyle='round,pad=0.2', facecolor='black', alpha=0.6)
+    # 색상 (BGR)
+    color_len_top    = (0, 255, 255)  # 노란색
+    color_len_bot    = (255, 255, 0)  # 시안
+    color_width_top  = (255, 0, 255)  # 마젠타
+    color_width_bot  = (0, 0, 255)    # 빨강
+    text_bg_color    = (0, 0, 0)
+    text_color       = (255, 255, 255)
+
+    font       = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.5
+    thickness  = 1
+
+    # ---- 길이 위쪽 (P1-P2, 노란색) ----
+    p1 = to_int_tuple(p_start_top)
+    p2 = to_int_tuple(p_end_top)
+    mid_top = ((p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2)
+
+    cv2.circle(img_bgr, p1, 4, color_len_top, -1)           # 시작점 원
+    draw_cross(img_bgr, p2, color_len_top, size=5)          # 도착점 X
+    cv2.arrowedLine(img_bgr, p1, p2, color_len_top, 2, tipLength=0.03)
+
+    text_top = f"{len_top_mm:.0f}mm"
+    (tw, th), _ = cv2.getTextSize(text_top, font, font_scale, thickness)
+    text_org = (mid_top[0] - tw // 2, mid_top[1] - 10)
+
+    # 텍스트 배경
+    cv2.rectangle(
+        img_bgr,
+        (text_org[0] - 3, text_org[1] - th - 3),
+        (text_org[0] + tw + 3, text_org[1] + 3),
+        text_bg_color,
+        -1
     )
+    cv2.putText(img_bgr, text_top, text_org, font, font_scale, text_color, thickness, cv2.LINE_AA)
+
+    # ---- 길이 아래쪽 (P3-P4, 시안색) ----
+    p1b = to_int_tuple(p_start_bot)
+    p2b = to_int_tuple(p_end_bot)
+    mid_bot = ((p1b[0] + p2b[0]) // 2, (p1b[1] + p2b[1]) // 2)
+
+    cv2.circle(img_bgr, p1b, 4, color_len_bot, -1)
+    draw_cross(img_bgr, p2b, color_len_bot, size=5)
+    cv2.arrowedLine(img_bgr, p1b, p2b, color_len_bot, 2, tipLength=0.03)
+
+    text_bot = f"{len_bot_mm:.0f}mm"
+    (tw, th), _ = cv2.getTextSize(text_bot, font, font_scale, thickness)
+    text_org_b = (mid_bot[0] - tw // 2, mid_bot[1] + th + 10)
+
+    cv2.rectangle(
+        img_bgr,
+        (text_org_b[0] - 3, text_org_b[1] - th - 3),
+        (text_org_b[0] + tw + 3, text_org_b[1] + 3),
+        text_bg_color,
+        -1
+    )
+    cv2.putText(img_bgr, text_bot, text_org_b, font, font_scale, text_color, thickness, cv2.LINE_AA)
+
+    # ---- 너비 위쪽 (P5-P6, 마젠타) ----
+    pw1 = to_int_tuple(p_start_width)
+    pw2 = to_int_tuple(p_end_width)
+    mid_w = ((pw1[0] + pw2[0]) // 2, (pw1[1] + pw2[1]) // 2)
+
+    cv2.circle(img_bgr, pw1, 4, color_width_top, -1)
+    draw_cross(img_bgr, pw2, color_width_top, size=5)
+    cv2.arrowedLine(img_bgr, pw1, pw2, color_width_top, 2, tipLength=0.03)
+
+    text_w_top = f"{width_top_mm:.0f}mm"
+    (tw, th), _ = cv2.getTextSize(text_w_top, font, font_scale, thickness)
+    text_org_w = (mid_w[0] - tw - 5, mid_w[1])
+
+    cv2.rectangle(
+        img_bgr,
+        (text_org_w[0] - 3, text_org_w[1] - th - 3),
+        (text_org_w[0] + tw + 3, text_org_w[1] + 3),
+        text_bg_color,
+        -1
+    )
+    cv2.putText(img_bgr, text_w_top, text_org_w, font, font_scale, text_color, thickness, cv2.LINE_AA)
+
+    # ---- 너비 아래쪽 (P7-P8, 라임) ----
+    pw1b = to_int_tuple(p_start_width_bottom)
+    pw2b = to_int_tuple(p_end_width_bottom)
+    mid_wb = ((pw1b[0] + pw2b[0]) // 2, (pw1b[1] + pw2b[1]) // 2)
+
+    cv2.circle(img_bgr, pw1b, 4, color_width_bot, -1)
+    draw_cross(img_bgr, pw2b, color_width_bot, size=5)
+    cv2.arrowedLine(img_bgr, pw1b, pw2b, color_width_bot, 2, tipLength=0.03)
+
+    text_w_bot = f"{width_bottom_mm:.0f}mm"
+    (tw, th), _ = cv2.getTextSize(text_w_bot, font, font_scale, thickness)
+    text_org_wb = (mid_wb[0] - tw - 5, mid_wb[1])
+
+    cv2.rectangle(
+        img_bgr,
+        (text_org_wb[0] - 3, text_org_wb[1] - th - 3),
+        (text_org_wb[0] + tw + 3, text_org_wb[1] + 3),
+        text_bg_color,
+        -1
+    )
+    cv2.putText(img_bgr, text_w_bot, text_org_wb, font, font_scale, text_color, thickness, cv2.LINE_AA)
 
     # ---------------------------
     # 5) CSV용 레코드 반환
@@ -1712,27 +1696,19 @@ def compute_and_draw_measurements(
 
 
 
-def load_and_prepare_frame(f_idx, fname):
+def load_and_prepare_frame_cv(f_idx, fname):
     img_path = os.path.join(Config.VIDEO_DIR, fname)
-    img = Image.open(img_path).convert("RGB")
-    W, H = img.size
+    img_bgr = cv2.imread(img_path)              # BGR
+    if img_bgr is None:
+        raise FileNotFoundError(img_path)
+    H, W = img_bgr.shape[:2]
+    return img_bgr, W, H, img_path
 
-    fig_w_inch = W / TARGET_DPI
-    fig_h_inch = H / TARGET_DPI
-    fig = plt.figure(figsize=(fig_w_inch, fig_h_inch))
-    ax = plt.gca()
-    ax.imshow(img)
-    ax.set_title(f"Frame {f_idx} : Matrix Transform Vis")
-    ax.set_xlim([0, W])
-    ax.set_ylim([H, 0])
-    ax.set_axis_off()
-
-    return img, fig, ax, W, H, img_path
 
 # ------------------------------------------------------------
 # 2. 마스크/Rotated Box 추출
 # ------------------------------------------------------------
-def extract_masks_and_rboxes(ax, masks, obj_id_1, obj_id_2, H, W):
+def extract_masks_and_rboxes(img_bgr, masks, obj_id_1, obj_id_2, H, W):
     mask_obj1 = masks.get(obj_id_1, None)
     mask_obj2 = masks.get(obj_id_2, None)
 
@@ -1744,11 +1720,11 @@ def extract_masks_and_rboxes(ax, masks, obj_id_1, obj_id_2, H, W):
         if mask is None:
             continue
 
-        edge_color = "orange" if oid == obj_id_1 else "deepskyblue"
+        edge_color = (0, 165, 255) if oid == obj_id_1 else (255, 191, 0)
 
         # 원래 마스크 그리기
         draw_mask_and_rbox(
-            ax, mask, oid, edge_color, H, W,
+            img_bgr, mask, oid, edge_color,
             Config.APPLY_EROSION, Config.EROSION_KERNEL_SIZE, Config.EROSION_ITERATIONS
         )
 
@@ -1790,7 +1766,7 @@ def prepare_obj2_points_and_rbox(
     pcd_path,
     mask_obj2,
     obj_id_2,
-    ax,
+    img_bgr,
     H,
     W
 ):
@@ -1825,7 +1801,7 @@ def prepare_obj2_points_and_rbox(
         final_mask = mask_obj2_updated & mask_obj2
         mask_obj2 = final_mask
         draw_mask_and_rbox(
-            ax, mask_obj2, obj_id_2, "deepskyblue", H, W,
+            img_bgr, mask_obj2, (255, 191, 0),
             Config.APPLY_EROSION, Config.EROSION_KERNEL_SIZE, Config.EROSION_ITERATIONS
         )
         mask_eroded_obj2 = apply_erosion(mask_obj2, Config.EROSION_KERNEL_SIZE, Config.EROSION_ITERATIONS) \
@@ -1927,96 +1903,112 @@ def reconstruct_slab_corners_3d(obj2_rbox_corners, normal_obj2, centroid_obj2):
 # ------------------------------------------------------------
 # 7. 3D 박스 → 2D 와이어프레임 그리기
 # ------------------------------------------------------------
-def draw_projected_box(ax, final_box_mesh):
+def draw_projected_box(img_bgr, final_box_mesh):
     if final_box_mesh is None:
         return
+
     tx_verts = np.asarray(final_box_mesh.vertices)
-    img_pts, _ = cv2.projectPoints(tx_verts, np.zeros(3), np.zeros(3), K_camera, D_dist)
+    img_pts, _ = cv2.projectPoints(
+        tx_verts, np.zeros(3), np.zeros(3), K_camera, D_dist
+    )
     img_pts = img_pts.reshape(-1, 2).astype(int)
+
     lines = [
-        [0, 1], [1, 2], [2, 3], [3, 0],
-        [4, 5], [5, 6], [6, 7], [7, 4],
-        [0, 4], [1, 5], [2, 6], [3, 7]
+        [0,1],[1,2],[2,3],[3,0],
+        [4,5],[5,6],[6,7],[7,4],
+        [0,4],[1,5],[2,6],[3,7]
     ]
+
     for s, e in lines:
-        ax.plot(
-            [img_pts[s, 0], img_pts[e, 0]],
-            [img_pts[s, 1], img_pts[e, 1]],
-            color='red', linewidth=1.5
-        )
+        p1 = (img_pts[s][0], img_pts[s][1])
+        p2 = (img_pts[e][0], img_pts[e][1])
+        cv2.line(img_bgr, p1, p2, (0,0,255), 2)
+
 
 # ------------------------------------------------------------
 # 8. Obj2 포인트 클라우드 투영 시각화
 # ------------------------------------------------------------
-def draw_projected_obj2_points(ax, obj2_pts_cam, W, H):
+def draw_projected_obj2_points(img_bgr, obj2_pts_cam, W, H):
     """
-    obj2_pts_cam (Obj2 필터링된 3D 포인트)를 2D로 투영하여 이미지에 표시
+    Obj2 포인트들을 2D로 투영하여 이미지에 점으로 표시 (OpenCV)
     """
     if obj2_pts_cam is None or len(obj2_pts_cam) == 0:
         return
-    
-    # 3D -> 2D 투영
+
     img_pts, _ = cv2.projectPoints(
         obj2_pts_cam, np.zeros(3), np.zeros(3), K_camera, D_dist
     )
     img_pts = img_pts.reshape(-1, 2)
-    
-    # 이미지 범위 내 포인트만 필터링
-    valid_mask = (
-        (img_pts[:, 0] >= 0) & (img_pts[:, 0] < W) &
-        (img_pts[:, 1] >= 0) & (img_pts[:, 1] < H)
+
+    valid = (
+        (img_pts[:,0] >= 0) & (img_pts[:,0] < W) &
+        (img_pts[:,1] >= 0) & (img_pts[:,1] < H)
     )
-    img_pts_valid = img_pts[valid_mask]
-    
-    # 포인트 그리기 (초록색 작은 점)
-    if len(img_pts_valid) > 0:
-        ax.scatter(
-            img_pts_valid[:, 0], 
-            img_pts_valid[:, 1],
-            c='r' \
-            'ed',           # 밝은 초록색
-            s=10,                # 작은 점 크기
-            alpha=1.0,          # 반투명
-            marker='.',
-            edgecolors='none'
-        )
-        print(f"Drew {len(img_pts_valid)} obj2_pts_cam points on image")
+    img_pts_valid = img_pts[valid]
+
+    # OpenCV 점 그리기
+    for u, v in img_pts_valid:
+        cv2.circle(img_bgr, (int(u), int(v)), 2, (0,0,255), -1)  # 작은 빨간 점
 
 # ------------------------------------------------------------
 # 9. Pose + 측정값 텍스트
 # ------------------------------------------------------------
-def draw_pose_and_measurements(ax, estimated_param, measurement_record):
+def draw_pose_and_measurements(img_bgr, estimated_param, measurement_record):
     if estimated_param is None:
         return
 
     tx, ty, yaw, z = estimated_param
-    pose_text = (
-        f"6DOF Pose:\n"
-        f"Trans: ({tx:.2f}, {ty:.2f}, {z:.2f})m\n"
-        f"Rot: ({np.degrees(yaw):.1f})°\n"
-    )
+
+    # 여러 줄을 그리기 위해 문자열 리스트로 관리
+    lines = [
+        "6DOF Pose:",
+        f"Trans: ({tx:.2f}, {ty:.2f}, {z:.2f}) m",
+        f"Rot: {np.degrees(yaw):.1f}°"
+    ]
 
     if measurement_record is not None:
-        pose_text += (
-            f"Length: T={measurement_record['P1-P2']:.1f}mm "
-            f"B={measurement_record['P3-P4']:.1f}mm\n"
-            f"Width: T={measurement_record['P5-P6']:.1f}mm "
-            f"B={measurement_record['P7-P8']:.1f}mm"
-        )
+        lines.append(f"L(T,B): {measurement_record['P1-P2']:.1f} / {measurement_record['P3-P4']:.1f} mm")
+        lines.append(f"W(T,B): {measurement_record['P5-P6']:.1f} / {measurement_record['P7-P8']:.1f} mm")
 
-    ax.text(
-        20, 40, pose_text,
-        color='white', fontsize=10,
-        bbox=dict(facecolor='black', alpha=0.5)
-    )
+    # 텍스트 출력
+    x0, y0 = 20, 40
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.55
+    color = (255,255,255)
+    thickness = 1
+
+    # 배경 박스
+    # 박스 크기 계산
+    text_width = 0
+    line_height = 18
+    for line in lines:
+        (w, h), _ = cv2.getTextSize(line, font, scale, thickness)
+        text_width = max(text_width, w)
+    box_w = text_width + 20
+    box_h = line_height * len(lines) + 20
+
+    # 반투명 박스 그리기
+    overlay = img_bgr.copy()
+    cv2.rectangle(overlay, (x0 - 10, y0 - 25),
+                  (x0 - 10 + box_w, y0 - 25 + box_h),
+                  (0,0,0), -1)
+    img_bgr[:] = cv2.addWeighted(overlay, 0.5, img_bgr, 0.5, 0)
+
+    # 내용 텍스트 그리기
+    y = y0
+    for line in lines:
+        cv2.putText(img_bgr, line, (x0, y),
+                    font, scale, color, thickness, cv2.LINE_AA)
+        y += line_height
+
 
 # ------------------------------------------------------------
 # 9. 프레임 저장
 # ------------------------------------------------------------
-def save_output_frame(fig, f_idx):
+def save_output_frame_cv(img_bgr, f_idx):
     out_path = os.path.join(Config.OUTPUT_DIR, f"frame_{f_idx:05d}.jpg")
-    plt.savefig(out_path, dpi=TARGET_DPI, bbox_inches='tight', pad_inches=0)
-    plt.close(fig)
+    cv2.imwrite(out_path, img_bgr)
+
 
 # ------------------------------------------------------------
 # 10. 메인: process_single_frame (리팩토링 버전)
@@ -2035,9 +2027,8 @@ def process_single_frame(
     
     # 0) 프레임/figure 준비
     t0 = time.time()
-    img, fig, ax, W, H, img_path = load_and_prepare_frame(f_idx, fname)
-    if timings is not None:
-        timings['load_image'] = timings.get('load_image', 0) + (time.time() - t0)
+    img_bgr, W, H, img_path = load_and_prepare_frame_cv(f_idx, fname)
+    timings['load_image'] = timings.get('load_image', 0) + (time.time() - t0)
 
     # PCD 경로
     pcd_path = os.path.join(Config.PCD_DIR, pcd_files[f_idx]) if f_idx < len(pcd_files) else None
@@ -2046,7 +2037,7 @@ def process_single_frame(
     t0 = time.time()
     masks = video_segments.get(f_idx, {})
     mask_obj1, mask_obj2, obj1_corners, obj2_rbox_corners = extract_masks_and_rboxes(
-        ax, masks, obj_id_1, obj_id_2, H, W
+        img_bgr, masks, obj_id_1, obj_id_2, H, W
     )
     if timings is not None:
         timings['extract_masks'] = timings.get('extract_masks', 0) + (time.time() - t0)
@@ -2074,7 +2065,7 @@ def process_single_frame(
             # 2) Obj2 포인트 + rbox
             t0 = time.time()
             obj2_pts_cam, mask_obj2, obj2_rbox_corners = prepare_obj2_points_and_rbox(
-                pcd_path, mask_obj2, obj_id_2, ax, H, W
+                pcd_path, mask_obj2, obj_id_2, img_bgr, H, W
             )
             if timings is not None:
                 timings['obj2_filtering'] = timings.get('obj2_filtering', 0) + (time.time() - t0)
@@ -2100,7 +2091,7 @@ def process_single_frame(
             if slab_corners_3d is not None and final_box_mesh is not None:
                 t0 = time.time()
                 measurement_record = compute_and_draw_measurements(
-                    ax,
+                    img_bgr,
                     f_idx,
                     np.asarray(final_box_mesh.vertices),
                     slab_corners_3d,
@@ -2115,13 +2106,13 @@ def process_single_frame(
         # 6) obj2_pts_cam 포인트 투영 그리기
         t0 = time.time()
         if obj2_pts_cam is not None:
-            draw_projected_obj2_points(ax, obj2_pts_cam, W, H)
+            draw_projected_obj2_points(img_bgr, obj2_pts_cam, W, H)
 
         # 7) 3D 박스 와이어프레임 2D에 그림
-        draw_projected_box(ax, final_box_mesh)
+        draw_projected_box(img_bgr, final_box_mesh)
 
         # 8) Pose/측정 텍스트
-        draw_pose_and_measurements(ax, estimated_param, measurement_record)
+        draw_pose_and_measurements(img_bgr, estimated_param, measurement_record)
         
         if timings is not None:
             timings['visualization'] = timings.get('visualization', 0) + (time.time() - t0)
@@ -2132,7 +2123,7 @@ def process_single_frame(
 
     # 9) 이미지 저장
     t0 = time.time()
-    save_output_frame(fig, f_idx)
+    save_output_frame_cv(img_bgr, f_idx)
     if timings is not None:
         timings['save_image'] = timings.get('save_image', 0) + (time.time() - t0)
         timings['total_per_frame'] = timings.get('total_per_frame', 0) + (time.time() - frame_start)
@@ -2337,39 +2328,12 @@ def main():
                 pct = (timings[key] / timings['total_per_frame']) * 100
                 print(f"   {label:.<20} {avg_time:7.3f}s ({pct:5.1f}%)")
     
+    print_timings(timings, n_frames=len(frame_names))
+
     print("\n" + "="*60)
     print("✅ Processing Complete")
     print("="*60 + "\n")
 
 
 if __name__ == "__main__":
-    # 1) SAM2 초기화 + 프롬프트 생성 + 프레임/PCD 리스트 준비
-    inference_state, frame_names, pcd_files, obj_id_1, obj_id_2 = initialize_sam2_and_prompts()
-
-    if len(frame_names) == 0:
-        print("❌ No image frames found in:", Config.VIDEO_DIR)
-        sys.exit(1)
-    if len(pcd_files) == 0:
-        print("⚠️ No PCD files found in:", Config.PCD_DIR)
-
-    # 2) SAM2로 전체 비디오에 대해 마스크 전파
-    print("\n==============================================")
-    print("Building video_segments (SAM2 propagate_in_video)...")
-    print("==============================================")
-    video_segments = build_video_segments(inference_state)
-
-    # 3) 모든 프레임 처리 + 측정값 계산
-    print("\n==============================================")
-    print("Processing all frames (pose + LiDAR + measurement)...")
-    print("==============================================")
-    measurement_records, timings = process_all_frames(
-        frame_names, pcd_files, video_segments, obj_id_1, obj_id_2
-    )
-
-    # 4) 결과 CSV 저장
-    save_measurements_csv(measurement_records)
-
-    # 5) 타이밍 요약 출력
-    print_timings(timings, n_frames=len(frame_names))
-
-    print("\n✅ All done.")
+    main()
